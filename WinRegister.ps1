@@ -401,6 +401,10 @@ function Test-UpdateAvailable {
     # Update LastCheckedAt now, regardless of outcome (so failures don't hammer the API).
     $Settings.Updates.LastCheckedAt = (Get-Date).ToString('o')
 
+    # Result has three possible Status values:
+    #   'UpdateAvailable' - newer release found (.Version, .Url, .Notes populated)
+    #   'UpToDate'        - check succeeded, current is latest
+    #   'CheckFailed'     - network error, 404, rate-limited, etc.
     try {
         # GitHub requires a User-Agent header. Use our own identifier.
         $headers = @{
@@ -411,29 +415,33 @@ function Test-UpdateAvailable {
     } catch {
         Write-Log "Update check failed (non-fatal): $_" -Level Warn
         Save-Settings -Settings $Settings
-        return $null
+        return [pscustomobject]@{ Status = 'CheckFailed'; ErrorMessage = $_.Exception.Message }
     }
 
     $tag = "$($resp.tag_name)"
-    if (-not $tag) { Save-Settings -Settings $Settings; return $null }
+    if (-not $tag) {
+        Save-Settings -Settings $Settings
+        return [pscustomobject]@{ Status = 'CheckFailed'; ErrorMessage = 'Empty tag_name in response' }
+    }
 
     $latestNormalized = $tag -replace '^v',''
     $Settings.Updates.LastSeenVersion = $latestNormalized
     Save-Settings -Settings $Settings
 
     if ($Settings.Updates.SkippedVersion -and ($Settings.Updates.SkippedVersion -eq $latestNormalized)) {
-        return $null   # user opted to skip this specific version
+        return [pscustomobject]@{ Status = 'UpToDate' }   # user-skipped; treat as up-to-date silently
     }
 
     if ((Compare-SemVer -A $latestNormalized -B $script:Cfg.Version) -gt 0) {
         return [pscustomobject]@{
+            Status  = 'UpdateAvailable'
             Version = $latestNormalized
             Url     = "$($resp.html_url)"
             Notes   = "$($resp.body)"
             Title   = "$($resp.name)"
         }
     }
-    return $null
+    return [pscustomobject]@{ Status = 'UpToDate' }
 }
 
 function Show-UpdateNotification {
@@ -528,9 +536,9 @@ function Invoke-StartupUpdateCheck {
     # Silent failure - never blocks the user's actual operation.
     try {
         $settings = Get-Settings
-        $update = Test-UpdateAvailable -Settings $settings
-        if ($update) {
-            Show-UpdateNotification -Update $update -Settings $settings
+        $result = Test-UpdateAvailable -Settings $settings
+        if ($result -and $result.Status -eq 'UpdateAvailable') {
+            Show-UpdateNotification -Update $result -Settings $settings
         }
     } catch {
         Write-Log "Startup update check failed: $_" -Level Warn
@@ -1830,13 +1838,17 @@ function Show-SettingsDialog {
         $btnCheckNow.Text = 'Checking...'
         [System.Windows.Forms.Application]::DoEvents()
         try {
-            $update = Test-UpdateAvailable -Settings $settings -Force
-            if ($update) {
-                Show-UpdateNotification -Update $update -Settings $settings
-            } else {
-                [System.Windows.Forms.MessageBox]::Show("You're on the latest version ($($script:Cfg.Version)).", 'WinRegister', 'OK', 'Information') | Out-Null
+            $result = Test-UpdateAvailable -Settings $settings -Force
+            switch ("$($result.Status)") {
+                'UpdateAvailable' { Show-UpdateNotification -Update $result -Settings $settings }
+                'UpToDate'        { [System.Windows.Forms.MessageBox]::Show("You're on the latest version ($($script:Cfg.Version)).", 'WinRegister', 'OK', 'Information') | Out-Null }
+                default {
+                    $msg = if ($result -and $result.ErrorMessage) {
+                        "Could not contact the update server:`n`n$($result.ErrorMessage)"
+                    } else { "Could not contact the update server." }
+                    [System.Windows.Forms.MessageBox]::Show($msg, 'WinRegister', 'OK', 'Warning') | Out-Null
+                }
             }
-            # Refresh "last checked" label
             try {
                 $reloaded = Get-Settings
                 $lblLast.Text = "Last checked: $(([DateTime]::Parse($reloaded.Updates.LastCheckedAt)).ToString('yyyy-MM-dd HH:mm'))"
@@ -2648,16 +2660,30 @@ try {
         'Doctor'     { Invoke-Doctor }
         'Settings'   { Show-SettingsDialog }
         'CheckUpdate' {
-            $settings = Get-Settings
-            $update = Test-UpdateAvailable -Settings $settings -Force
-            if ($update) {
-                Show-UpdateNotification -Update $update -Settings $settings
-            } else {
-                Initialize-DpiAwareness
-                Add-Type -AssemblyName System.Windows.Forms
-                [System.Windows.Forms.MessageBox]::Show(
-                    "You're on the latest version ($($script:Cfg.Version)).",
-                    'WinRegister', 'OK', 'Information') | Out-Null
+            # NOTE: must not use $settings here - it collides case-insensitively
+            # with the script param [switch]$Settings and triggers a switch-cast error.
+            $prefs = Get-Settings
+            $result = Test-UpdateAvailable -Settings $prefs -Force
+            Initialize-DpiAwareness
+            Add-Type -AssemblyName System.Windows.Forms
+            switch ("$($result.Status)") {
+                'UpdateAvailable' {
+                    Show-UpdateNotification -Update $result -Settings $prefs
+                }
+                'UpToDate' {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "You're on the latest version ($($script:Cfg.Version)).",
+                        'WinRegister', 'OK', 'Information') | Out-Null
+                }
+                default {
+                    # CheckFailed - distinguish from up-to-date so user knows
+                    $msg = if ($result -and $result.ErrorMessage) {
+                        "Could not contact the update server:`n`n$($result.ErrorMessage)"
+                    } else {
+                        "Could not contact the update server. Try again later."
+                    }
+                    [System.Windows.Forms.MessageBox]::Show($msg, 'WinRegister', 'OK', 'Warning') | Out-Null
+                }
             }
         }
         default      { Show-Help }
