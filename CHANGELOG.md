@@ -4,6 +4,58 @@ All notable changes to WinRegister are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-05-12
+
+### Added
+- **Settings UI overhaul.** Every section now lives in a proper `GroupBox`,
+  every checkbox has a tooltip explaining what it does, accessibility names
+  are set for screen-reader compatibility, and the dialog now has icons +
+  keyboard mnemonics (`&Save`, `&Cancel`).
+- **Registrations tab in Settings.** Lists every program WinRegister has
+  registered (Name, Vendor, Version, Status, Path). Double-click a row to
+  reveal the executable in Explorer; select + click *Unregister selected*
+  to remove. Status column shows **MISSING** in red when the target
+  executable has been deleted. *Repair* and *Refresh* buttons inline.
+- **About tab: file-locations panel.** Read-only paths for the settings
+  file, log file, database file, the installed script, and the data
+  folder. *Open* buttons next to each so power users can edit/inspect.
+- **`-SelfTest` command** runs an internal verification suite (17 tests
+  across PE detection, blacklist, settings, AppUserModelID generation,
+  and full register/unregister round-trip). Useful for CI and for
+  debugging "is this install healthy?" situations.
+- **`-Version` command** prints just the version string.
+- **`Registration.StartMenuSubfolder`** setting nests registered shortcuts
+  under a Start Menu subfolder (e.g. "Portable Apps").
+- **`Registration.FolderScanDepth`** setting controls how deep the
+  primary-exe scan recurses when registering a folder (default 4).
+- **`Registration.ExtraBlacklist`** setting accepts user-added glob
+  patterns on top of the built-in installer/helper filter. Useful when
+  you want to permanently refuse a class of binaries.
+- **`Backup-File` helper** snapshots `registrations.json` before any
+  purge and `settings.json` before any reset. Backups land beside the
+  original with a `.bak.<UTC>` suffix.
+
+### Changed
+- **Settings file lock.** `Save-Settings` now uses
+  `FileShare.None` and a retry loop, preventing the race when an update
+  check writes `LastCheckedAt` concurrently with the Settings UI saving.
+- **Type-validating settings merge.** If a user manually edits
+  `settings.json` and enters a wrong type (e.g., a string where a bool
+  was expected), the merge layer soft-coerces or falls back to the
+  default for that field instead of letting the bad value propagate.
+  Schema version bumped to 2.
+- **Blacklist refined.** `python`, `pythonw`, `node`, `nodew`, `update`,
+  `updater` are no longer blocked — legitimate portable installs of
+  those tools are now registrable. `unins000`/`unins001`/`unins002`
+  still blocked (the actual Inno uninstaller binaries).
+- **`.lnk` handling.** Shortcuts with no file target (Control Panel
+  applets, shell namespace shortcuts) now produce a clear error instead
+  of the cryptic "Shortcut target unreachable: " (with an empty path).
+
+### Fixed
+- Settings UI hardcoded `$nameBox.Focus()` reference that no longer
+  existed in v1.2.2 (would have errored on dialog open if reached).
+
 ## [1.2.2] - 2026-05-12
 
 ### Added
@@ -115,6 +167,7 @@ versioning follows [Semantic Versioning](https://semver.org/).
 - Inline C# `IShellLink`/`IPropertyStore` COM interop.
 - Persistent registration store at `%LOCALAPPDATA%\WinRegister\registrations.json`.
 
+[1.3.0]: https://github.com/trustxix/winregister/releases/tag/v1.3.0
 [1.2.2]: https://github.com/trustxix/winregister/releases/tag/v1.2.2
 [1.2.1]: https://github.com/trustxix/winregister/releases/tag/v1.2.1
 [1.2.0]: https://github.com/trustxix/winregister/releases/tag/v1.2.0

@@ -123,6 +123,12 @@ param(
     [Parameter(ParameterSetName = 'CheckUpdate', Mandatory)]
     [switch]$CheckUpdate,
 
+    [Parameter(ParameterSetName = 'Version', Mandatory)]
+    [switch]$Version,
+
+    [Parameter(ParameterSetName = 'SelfTest', Mandatory)]
+    [switch]$SelfTest,
+
     [Parameter(ParameterSetName = 'Register')]
     [string]$DisplayName,
 
@@ -142,9 +148,9 @@ $ErrorActionPreference = 'Stop'
 #region Configuration ----------------------------------------------------------
 
 $script:Cfg = [pscustomobject]@{
-    Version              = '1.2.2'
+    Version              = '1.3.0'
     SchemaVersion        = 2
-    SettingsSchemaVersion= 1
+    SettingsSchemaVersion= 2
     AppName              = 'WinRegister'
     Publisher            = 'trustxix'
     HomepageUrl          = 'https://github.com/trustxix/winregister'
@@ -176,15 +182,19 @@ $script:Cfg = [pscustomobject]@{
     MaxArpDisplayName    = 32
     MaxAumid             = 128
     MaxPascalSegment     = 80
+    # Conservative blacklist: catches obvious installers, uninstallers, and helper
+    # binaries that shouldn't be registered as user-facing apps. Refined to avoid
+    # false-positives against legitimate portable tools (e.g., a user's portable
+    # Python install is now allowed; previously 'python' was an exact-match block).
+    # Users can override per-call with -Force, or extend via Settings.Registration.ExtraBlacklist.
     BlacklistPatterns    = @(
-        'unins*', 'uninstall*', 'setup', 'setup_*', 'installer', 'install',
+        'unins000', 'unins001', 'unins002', 'uninstall', 'uninst', 'uninst*',
+        'setup', 'setup_*', 'installer',
         'vc_redist*', 'vcredist*', 'msvcr*', 'msvcp*', 'ucrtbase*',
         'crashpad_handler', '*crashreporter*', '*crash_handler*', '*-crashpad*',
         'dxsetup', 'dotnet-host*', 'msedgewebview2',
         '*-helper', '*_helper', '* Helper',
         '*-gpu', '*_gpu',
-        '*-updater', '*_updater', 'update', 'updater',
-        'python', 'pythonw', 'node', 'nodew',
         'elevate', 'elevation_service'
     )
     ProtectedPaths       = @(
@@ -294,7 +304,10 @@ function Get-DefaultSettings {
             SkippedVersion     = ''   # user clicked "skip this version"
         }
         Registration = [pscustomobject]@{
-            AutoDetectPrimaryExe = $true   # in folder mode, auto-pick the main exe
+            AutoDetectPrimaryExe = $true     # in folder mode, auto-pick the main exe
+            StartMenuSubfolder   = ''        # optional subfolder under Programs (empty = top-level)
+            ExtraBlacklist       = @()       # user-added blacklist patterns
+            FolderScanDepth      = 4         # max recursion when scanning folders for the main .exe
         }
         Modified = (Get-Date).ToString('o')
     }
@@ -307,8 +320,11 @@ function Initialize-SettingsFolder {
 }
 
 function Merge-SettingsDefaults {
-    # Recursively fill missing properties on $loaded from $defaults. Lets us
-    # add new settings in future versions without breaking older config files.
+    # Recursively fill missing properties on $loaded from $defaults. Also
+    # validates type compatibility: if a user has manually edited settings.json
+    # and entered an incompatible type (e.g., a string where a bool was expected),
+    # we revert to the default for that field rather than letting the value
+    # propagate and trigger a runtime error later.
     param($Loaded, $Defaults)
     if ($null -eq $Loaded)   { return $Defaults }
     if ($null -eq $Defaults) { return $Loaded }
@@ -318,9 +334,29 @@ function Merge-SettingsDefaults {
         $hasIt = $Loaded.PSObject.Properties[$name]
         if (-not $hasIt) {
             Add-Member -InputObject $Loaded -NotePropertyName $name -NotePropertyValue $defVal -Force
-        } elseif ($defVal -is [pscustomobject] -and $hasIt.Value -is [pscustomobject]) {
-            $merged = Merge-SettingsDefaults -Loaded $hasIt.Value -Defaults $defVal
-            $Loaded.$name = $merged
+            continue
+        }
+        $loadedVal = $hasIt.Value
+        # Recurse on nested objects.
+        if ($defVal -is [pscustomobject] -and $loadedVal -is [pscustomobject]) {
+            $Loaded.$name = Merge-SettingsDefaults -Loaded $loadedVal -Defaults $defVal
+            continue
+        }
+        # Type compatibility check. Booleans and numerics in JSON can come back
+        # as strings if the user edited by hand - try a soft coerce, then fall
+        # back to the default on failure.
+        if ($null -ne $defVal -and $null -ne $loadedVal) {
+            $defType = $defVal.GetType()
+            if (-not ($loadedVal -is $defType)) {
+                try {
+                    if ($defType -eq [bool])   { $Loaded.$name = [bool]::Parse([string]$loadedVal); continue }
+                    if ($defType -eq [int])    { $Loaded.$name = [int]::Parse([string]$loadedVal); continue }
+                    if ($defType -eq [string]) { $Loaded.$name = [string]$loadedVal; continue }
+                    if ($defType.IsArray)      { $Loaded.$name = @($loadedVal); continue }
+                } catch { }
+                Write-Log "Settings: type mismatch on '$name' (expected $($defType.Name)); reverting to default." -Level Warn
+                $Loaded.$name = $defVal
+            }
         }
     }
     return $Loaded
@@ -344,17 +380,65 @@ function Get-Settings {
 }
 
 function Save-Settings {
+    # Atomic, file-locked write. The lock prevents the rare but real race when
+    # two settings UIs or a UI + an update check both try to save at the same
+    # time. Pattern: temp file + Move-Item replace + retry on contention.
     param([pscustomobject]$Settings)
     Initialize-SettingsFolder
     $Settings | Add-Member -NotePropertyName 'Modified' -NotePropertyValue (Get-Date).ToString('o') -Force
     $json = $Settings | ConvertTo-Json -Depth 10
     $tmp = "$($script:Cfg.SettingsFile).tmp"
-    Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8
-    Move-Item -LiteralPath $tmp -Destination $script:Cfg.SettingsFile -Force
+
+    $maxAttempts = 50   # 5 seconds total at 100ms back-off
+    for ($i = 1; $i -le $maxAttempts; $i++) {
+        try {
+            # Hold exclusive write on the temp file until we've serialized, then
+            # release before the atomic Move-Item (Move requires no open handles).
+            $fs = [System.IO.File]::Open(
+                $tmp,
+                [System.IO.FileMode]::Create,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+            try {
+                $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+                $fs.Write($bytes, 0, $bytes.Length)
+                $fs.Flush()
+            } finally {
+                $fs.Dispose()
+            }
+            Move-Item -LiteralPath $tmp -Destination $script:Cfg.SettingsFile -Force
+            return
+        } catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    throw "Could not write settings.json after $maxAttempts attempts"
+}
+
+function Backup-File {
+    # Snapshot a file to <path>.bak.<UTC>. Used before destructive operations
+    # like Reset-Settings or PurgeAllRegistrations. Caller can ignore failure;
+    # backup is best-effort and never blocks the primary operation.
+    param([string]$Path, [string]$Tag = '')
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+        $suffix = if ($Tag) { "$Tag-$stamp" } else { $stamp }
+        $bak = "$Path.bak.$suffix"
+        Copy-Item -LiteralPath $Path -Destination $bak -Force
+        Write-Log "Backed up $Path -> $bak"
+        return $bak
+    } catch {
+        Write-Log "Backup of $Path failed (non-fatal): $_" -Level Warn
+        return $null
+    }
 }
 
 function Reset-Settings {
     if (Test-Path -LiteralPath $script:Cfg.SettingsFile) {
+        # Best-effort snapshot before destroying user state.
+        Backup-File -Path $script:Cfg.SettingsFile -Tag 'reset' | Out-Null
         Remove-Item -LiteralPath $script:Cfg.SettingsFile -Force
     }
     Save-Settings -Settings (Get-DefaultSettings)
@@ -891,10 +975,14 @@ function Test-ProtectedPath {
 }
 
 function Test-IsBlacklisted {
-    param([string]$ExeBaseName)
+    # Built-in patterns plus any user-added entries from settings.
+    param([string]$ExeBaseName, [string[]]$ExtraPatterns = @())
     $name = $ExeBaseName.ToLowerInvariant()
     foreach ($pat in $script:Cfg.BlacklistPatterns) {
         if ($name -like $pat) { return $true }
+    }
+    foreach ($pat in $ExtraPatterns) {
+        if ($pat -and ($name -like $pat.ToLowerInvariant())) { return $true }
     }
     return $false
 }
@@ -956,16 +1044,19 @@ function Get-ExecutableScore {
 }
 
 function Find-PrimaryExecutable {
-    param([string]$FolderPath)
+    param(
+        [string]$FolderPath,
+        [int]$MaxDepth = 4
+    )
 
-    Write-Log "Scanning folder for primary executable: $FolderPath"
+    Write-Log "Scanning folder for primary executable: $FolderPath (depth=$MaxDepth)"
 
     if (-not (Test-Path -LiteralPath $FolderPath -PathType Container)) {
         throw "Folder not found: $FolderPath"
     }
 
     $folderFull = [System.IO.Path]::GetFullPath($FolderPath)
-    $exes = @(Get-ChildItem -LiteralPath $folderFull -Filter *.exe -Recurse -Depth 4 -Force -ErrorAction SilentlyContinue |
+    $exes = @(Get-ChildItem -LiteralPath $folderFull -Filter *.exe -Recurse -Depth $MaxDepth -Force -ErrorAction SilentlyContinue |
         Where-Object { -not $_.PSIsContainer })
 
     if ($exes.Count -eq 0) {
@@ -1005,7 +1096,10 @@ function Find-PrimaryExecutable {
 }
 
 function Resolve-Target {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [int]$MaxFolderDepth = 4
+    )
 
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Path not found: $Path"
@@ -1015,7 +1109,7 @@ function Resolve-Target {
     $ext = $item.Extension.ToLowerInvariant()
 
     if ($item.PSIsContainer) {
-        return Find-PrimaryExecutable -FolderPath $item.FullName
+        return Find-PrimaryExecutable -FolderPath $item.FullName -MaxDepth $MaxFolderDepth
     }
 
     if ($ext -eq '.lnk') {
@@ -1028,11 +1122,16 @@ function Resolve-Target {
         } finally {
             if ($shell) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) }
         }
-        if (-not $target -or -not (Test-Path -LiteralPath $target)) {
-            throw "Shortcut target unreachable: $target"
+        # .lnk files can legitimately have an empty TargetPath (Control Panel
+        # applets, shell namespaces like ::{GUID}). We can't register those.
+        if (-not $target) {
+            throw "This shortcut has no file target (it points to a shell namespace or Control Panel item, which can't be registered as a program)."
+        }
+        if (-not (Test-Path -LiteralPath $target)) {
+            throw "Shortcut target is missing or unreachable: $target"
         }
         if ((Get-Item -LiteralPath $target).PSIsContainer) {
-            return Find-PrimaryExecutable -FolderPath $target
+            return Find-PrimaryExecutable -FolderPath $target -MaxDepth $MaxFolderDepth
         }
         if ([System.IO.Path]::GetExtension($target).ToLowerInvariant() -eq '.lnk') {
             throw "Refusing to follow .lnk -> .lnk chain to avoid loops."
@@ -1701,128 +1800,195 @@ function Show-SettingsDialog {
 
     $settings = Get-Settings
 
+    # Single ToolTip provider serves every control on the form.
+    $tt = New-Object System.Windows.Forms.ToolTip
+    $tt.AutoPopDelay = 12000
+    $tt.InitialDelay = 400
+    $tt.ReshowDelay  = 250
+
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'WinRegister Settings'
     $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
-    $form.ClientSize = New-Object System.Drawing.Size(560, 460)
+    $form.ClientSize = New-Object System.Drawing.Size(620, 540)
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false; $form.MinimizeBox = $false
     $form.BackColor = [System.Drawing.Color]::FromArgb(248, 249, 251)
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $form.TopMost = $true
+    try {
+        $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon(
+            [Environment]::ExpandEnvironmentVariables('%SystemRoot%\System32\imageres.dll'))
+    } catch { }
 
     $tabs = New-Object System.Windows.Forms.TabControl
     $tabs.Location = New-Object System.Drawing.Point(12, 12)
-    $tabs.Size = New-Object System.Drawing.Size(536, 390)
+    $tabs.Size = New-Object System.Drawing.Size(596, 478)
     $form.Controls.Add($tabs)
 
     # ---------- General tab ----------
     $tabGeneral = New-Object System.Windows.Forms.TabPage
-    $tabGeneral.Text = 'General'
+    $tabGeneral.Text = '  General  '
     $tabGeneral.BackColor = [System.Drawing.Color]::White
     $tabs.TabPages.Add($tabGeneral)
 
-    function New-SectionHeader {
-        param($Parent, $Text, $Y)
-        $lbl = New-Object System.Windows.Forms.Label
-        $lbl.Text = $Text
-        $lbl.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10)
-        $lbl.AutoSize = $true
-        $lbl.Location = New-Object System.Drawing.Point(18, $Y)
-        $Parent.Controls.Add($lbl)
-    }
-
-    function New-CheckBox {
-        param($Parent, $Text, $Y, $Checked, $Tag)
+    function New-CheckBoxRow {
+        param($Parent, $Text, $Checked, $X, $Y, $Tooltip)
         $cb = New-Object System.Windows.Forms.CheckBox
         $cb.Text = $Text
         $cb.AutoSize = $true
         $cb.Checked = [bool]$Checked
-        $cb.Location = New-Object System.Drawing.Point(28, $Y)
-        $cb.Tag = $Tag
+        $cb.Location = New-Object System.Drawing.Point($X, $Y)
+        $cb.AccessibleName = $Text
         $Parent.Controls.Add($cb)
+        if ($Tooltip) { $tt.SetToolTip($cb, $Tooltip) }
         return $cb
     }
+    function New-Group {
+        param($Parent, $Text, $X, $Y, $W, $H)
+        $g = New-Object System.Windows.Forms.GroupBox
+        $g.Text = $Text
+        $g.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+        $g.Location = New-Object System.Drawing.Point($X, $Y)
+        $g.Size = New-Object System.Drawing.Size($W, $H)
+        $Parent.Controls.Add($g)
+        return $g
+    }
 
-    New-SectionHeader -Parent $tabGeneral -Text 'Confirmation dialogs' -Y 20
-    $cbAskReg   = New-CheckBox -Parent $tabGeneral -Text 'Ask before registering a program' -Y 50  -Checked $settings.Confirmation.AskOnRegister -Tag 'AskOnRegister'
-    $cbAskUnreg = New-CheckBox -Parent $tabGeneral -Text 'Ask before unregistering a program' -Y 75 -Checked $settings.Confirmation.AskOnUnregister -Tag 'AskOnUnregister'
+    $gbConfirm = New-Group -Parent $tabGeneral -Text 'Confirmation prompts' -X 16 -Y 14 -W 556 -H 80
+    $cbAskReg   = New-CheckBoxRow -Parent $gbConfirm -Text 'Ask before registering a program'   -Checked $settings.Confirmation.AskOnRegister   -X 16 -Y 22 -Tooltip 'When on, a confirmation dialog appears each time you click Register so you can edit the display name before committing. Turn off for instant one-click registration.'
+    $cbAskUnreg = New-CheckBoxRow -Parent $gbConfirm -Text 'Ask before unregistering a program' -Checked $settings.Confirmation.AskOnUnregister -X 16 -Y 48 -Tooltip 'When on, a yes/no confirmation appears before removing a registration. Recommended for safety - the underlying program is never deleted regardless.'
 
-    New-SectionHeader -Parent $tabGeneral -Text 'Notifications' -Y 115
-    $cbNotifReg   = New-CheckBox -Parent $tabGeneral -Text 'Show toast after successful register'   -Y 145 -Checked $settings.Notifications.ShowOnRegister   -Tag 'ShowOnRegister'
-    $cbNotifUnreg = New-CheckBox -Parent $tabGeneral -Text 'Show toast after successful unregister' -Y 170 -Checked $settings.Notifications.ShowOnUnregister -Tag 'ShowOnUnregister'
+    $gbNotif = New-Group -Parent $tabGeneral -Text 'Notifications' -X 16 -Y 104 -W 556 -H 80
+    $cbNotifReg   = New-CheckBoxRow -Parent $gbNotif -Text 'Show toast after successful register'   -Checked $settings.Notifications.ShowOnRegister   -X 16 -Y 22 -Tooltip 'Brief blue toast notification in the bottom-right corner confirming the program was added.'
+    $cbNotifUnreg = New-CheckBoxRow -Parent $gbNotif -Text 'Show toast after successful unregister' -Checked $settings.Notifications.ShowOnUnregister -X 16 -Y 48 -Tooltip 'Brief blue toast notification confirming the program was removed.'
 
-    New-SectionHeader -Parent $tabGeneral -Text 'Registration behavior' -Y 210
-    $cbAutoExe = New-CheckBox -Parent $tabGeneral -Text 'Auto-detect primary executable in folders (recommended)' -Y 240 -Checked $settings.Registration.AutoDetectPrimaryExe -Tag 'AutoDetectPrimaryExe'
+    $gbReg = New-Group -Parent $tabGeneral -Text 'Registration behavior' -X 16 -Y 194 -W 556 -H 158
+    $cbAutoExe = New-CheckBoxRow -Parent $gbReg -Text 'Auto-detect primary executable when registering a folder' -Checked $settings.Registration.AutoDetectPrimaryExe -X 16 -Y 22 -Tooltip 'When right-clicking a folder, WinRegister scans for the main .exe (filters out installers, helpers, crash handlers) and registers it. If off, you must right-click the .exe directly.'
 
-    New-SectionHeader -Parent $tabGeneral -Text 'Actions' -Y 280
+    $lblSub = New-Object System.Windows.Forms.Label
+    $lblSub.Text = 'Start Menu subfolder:'
+    $lblSub.AutoSize = $true
+    $lblSub.Location = New-Object System.Drawing.Point(16, 54)
+    $gbReg.Controls.Add($lblSub)
+    $tt.SetToolTip($lblSub, "Optional: nests registered shortcuts under a subfolder of Start Menu Programs (e.g. 'Portable Apps'). Empty = top-level.")
 
+    $txtSub = New-Object System.Windows.Forms.TextBox
+    $txtSub.Text = [string](Get-SafeProperty $settings.Registration 'StartMenuSubfolder' -Default '')
+    $txtSub.Location = New-Object System.Drawing.Point(170, 51)
+    $txtSub.Size = New-Object System.Drawing.Size(250, 24)
+    $txtSub.MaxLength = 60
+    $gbReg.Controls.Add($txtSub)
+    $tt.SetToolTip($txtSub, "Example: 'Portable Apps' makes shortcuts appear under Start Menu -> Portable Apps -> <name>.")
+
+    $lblDepth = New-Object System.Windows.Forms.Label
+    $lblDepth.Text = 'Folder scan depth:'
+    $lblDepth.AutoSize = $true
+    $lblDepth.Location = New-Object System.Drawing.Point(16, 86)
+    $gbReg.Controls.Add($lblDepth)
+
+    $numDepth = New-Object System.Windows.Forms.NumericUpDown
+    $numDepth.Minimum = 1; $numDepth.Maximum = 10
+    $numDepth.Value = [int](Get-SafeProperty $settings.Registration 'FolderScanDepth' -Default 4)
+    $numDepth.Location = New-Object System.Drawing.Point(170, 83)
+    $numDepth.Size = New-Object System.Drawing.Size(60, 24)
+    $gbReg.Controls.Add($numDepth)
+    $tt.SetToolTip($numDepth, "How many subdirectory levels to scan for the main .exe. 4 covers nearly every app.")
+
+    $lblBL = New-Object System.Windows.Forms.Label
+    $lblBL.Text = 'Custom blacklist:'
+    $lblBL.AutoSize = $true
+    $lblBL.Location = New-Object System.Drawing.Point(16, 118)
+    $gbReg.Controls.Add($lblBL)
+    $tt.SetToolTip($lblBL, "Comma-separated glob patterns of .exe basenames to refuse, in addition to the built-in installer/helper filters. Example: 'launcher,*-tray,oldtool*'.")
+
+    $existingBL = @(Get-SafeProperty $settings.Registration 'ExtraBlacklist' -Default @())
+    $txtBL = New-Object System.Windows.Forms.TextBox
+    $txtBL.Text = ($existingBL -join ', ')
+    $txtBL.Location = New-Object System.Drawing.Point(170, 115)
+    $txtBL.Size = New-Object System.Drawing.Size(360, 24)
+    $gbReg.Controls.Add($txtBL)
+
+    $gbActions = New-Group -Parent $tabGeneral -Text 'Actions' -X 16 -Y 362 -W 556 -H 76
     $btnClear = New-Object System.Windows.Forms.Button
     $btnClear.Text = 'Clear all registered programs...'
     $btnClear.Size = New-Object System.Drawing.Size(220, 30)
-    $btnClear.Location = New-Object System.Drawing.Point(28, 310)
+    $btnClear.Location = New-Object System.Drawing.Point(16, 28)
+    $gbActions.Controls.Add($btnClear)
+    $tt.SetToolTip($btnClear, "Removes every program WinRegister has registered. The executables themselves are not deleted. A backup of registrations.json is saved first.")
+
+    # See trailing handlers below - they reference these variables
+    $btnLog = New-Object System.Windows.Forms.Button
+    $btnLog.Text = 'Open data folder'
+    $btnLog.Size = New-Object System.Drawing.Size(140, 30)
+    $btnLog.Location = New-Object System.Drawing.Point(248, 28)
+    $btnLog.Add_Click({ try { Start-Process explorer.exe $script:Cfg.DataFolder } catch { } })
+    $gbActions.Controls.Add($btnLog)
+    $tt.SetToolTip($btnLog, "Opens %LOCALAPPDATA%\WinRegister - contains the log, registration database, and backups.")
+
+    $btnReset = New-Object System.Windows.Forms.Button
+    $btnReset.Text = 'Reset settings'
+    $btnReset.Size = New-Object System.Drawing.Size(140, 30)
+    $btnReset.Location = New-Object System.Drawing.Point(398, 28)
+    $gbActions.Controls.Add($btnReset)
+    $tt.SetToolTip($btnReset, "Reverts every preference to its default. Registered programs are not affected. A backup of settings.json is saved first.")
+
+    # Wire the Clear-all button handler (defined above)
     $btnClear.Add_Click({
         $count = (Get-RegistrationStore).Count
         if ($count -eq 0) {
             [System.Windows.Forms.MessageBox]::Show("Nothing to clear - no programs are registered.", 'WinRegister', 'OK', 'Information') | Out-Null
             return
         }
-        $ok = Show-ConfirmYesNo -Title 'Clear all registrations' -Message "This will unregister all $count programs you've added with WinRegister. The programs themselves will NOT be deleted - only their entries from Windows Search, Start Menu, and Apps & Features.`n`nContinue?"
+        $ok = Show-ConfirmYesNo -Title 'Clear all registrations' -Message "This will unregister all $count programs you've added with WinRegister. The programs themselves will NOT be deleted - only their entries from Windows Search, Start Menu, and Apps & Features.`n`n(A backup of registrations.json is saved under %LOCALAPPDATA%\WinRegister\.)`n`nContinue?"
         if ($ok) {
             Invoke-PurgeAllRegistrations
             [System.Windows.Forms.MessageBox]::Show("Cleared $count registrations.", 'WinRegister', 'OK', 'Information') | Out-Null
         }
     })
-    $tabGeneral.Controls.Add($btnClear)
 
-    $btnLog = New-Object System.Windows.Forms.Button
-    $btnLog.Text = 'Open log folder'
-    $btnLog.Size = New-Object System.Drawing.Size(140, 30)
-    $btnLog.Location = New-Object System.Drawing.Point(258, 310)
-    $btnLog.Add_Click({ try { Start-Process explorer.exe $script:Cfg.DataFolder } catch { } })
-    $tabGeneral.Controls.Add($btnLog)
-
-    $btnReset = New-Object System.Windows.Forms.Button
-    $btnReset.Text = 'Reset settings'
-    $btnReset.Size = New-Object System.Drawing.Size(110, 30)
-    $btnReset.Location = New-Object System.Drawing.Point(408, 310)
     $btnReset.Add_Click({
-        $ok = Show-ConfirmYesNo -Title 'Reset settings' -Message 'Reset all WinRegister preferences to defaults? (Registered programs are not affected.)'
+        $ok = Show-ConfirmYesNo -Title 'Reset settings' -Message 'Reset all WinRegister preferences to defaults? Your registered programs are NOT affected. A backup of settings.json is saved first.'
         if ($ok) {
             Reset-Settings
             $form.DialogResult = 'Retry'; $form.Close()
         }
     })
-    $tabGeneral.Controls.Add($btnReset)
 
     # ---------- Updates tab ----------
     $tabUpdates = New-Object System.Windows.Forms.TabPage
-    $tabUpdates.Text = 'Updates'
+    $tabUpdates.Text = '  Updates  '
     $tabUpdates.BackColor = [System.Drawing.Color]::White
     $tabs.TabPages.Add($tabUpdates)
 
-    New-SectionHeader -Parent $tabUpdates -Text 'Automatic update checks' -Y 20
-    $cbUpdates = New-CheckBox -Parent $tabUpdates -Text 'Check for updates on startup' -Y 50 -Checked $settings.Updates.CheckEnabled -Tag 'CheckEnabled'
+    $gbU = New-Group -Parent $tabUpdates -Text 'Automatic update checks' -X 16 -Y 14 -W 556 -H 240
+    $cbUpdates = New-CheckBoxRow -Parent $gbU -Text 'Check for updates on startup' -Checked $settings.Updates.CheckEnabled -X 16 -Y 22 -Tooltip "Each time you run a Register, Unregister, or Settings action, WinRegister will at most once per N days hit the GitHub Releases API to see if a newer version exists. Silent unless an update is found."
 
     $lblFreq = New-Object System.Windows.Forms.Label
-    $lblFreq.Text = 'Check frequency (days):'
+    $lblFreq.Text = 'Check at most every:'
     $lblFreq.AutoSize = $true
-    $lblFreq.Location = New-Object System.Drawing.Point(28, 85)
-    $tabUpdates.Controls.Add($lblFreq)
+    $lblFreq.Location = New-Object System.Drawing.Point(16, 56)
+    $gbU.Controls.Add($lblFreq)
 
     $numFreq = New-Object System.Windows.Forms.NumericUpDown
     $numFreq.Minimum = 1; $numFreq.Maximum = 90
     $numFreq.Value = [int]$settings.Updates.CheckFrequencyDays
-    $numFreq.Location = New-Object System.Drawing.Point(200, 82)
+    $numFreq.Location = New-Object System.Drawing.Point(160, 53)
     $numFreq.Size = New-Object System.Drawing.Size(60, 24)
-    $tabUpdates.Controls.Add($numFreq)
+    $gbU.Controls.Add($numFreq)
+    $tt.SetToolTip($numFreq, "Minimum days between automatic checks. The 'Check now' button always runs immediately.")
+
+    $lblFreqUnit = New-Object System.Windows.Forms.Label
+    $lblFreqUnit.Text = 'days'
+    $lblFreqUnit.AutoSize = $true
+    $lblFreqUnit.Location = New-Object System.Drawing.Point(228, 56)
+    $gbU.Controls.Add($lblFreqUnit)
 
     $lblCurrent = New-Object System.Windows.Forms.Label
     $lblCurrent.Text = "Installed version: $($script:Cfg.Version)"
     $lblCurrent.AutoSize = $true
-    $lblCurrent.Location = New-Object System.Drawing.Point(28, 130)
-    $tabUpdates.Controls.Add($lblCurrent)
+    $lblCurrent.Location = New-Object System.Drawing.Point(16, 96)
+    $gbU.Controls.Add($lblCurrent)
 
     $lblLast = New-Object System.Windows.Forms.Label
     $lastTxt = if ($settings.Updates.LastCheckedAt -and $settings.Updates.LastCheckedAt -ne '1970-01-01T00:00:00Z') {
@@ -1831,13 +1997,16 @@ function Show-SettingsDialog {
     $lblLast.Text = "Last checked: $lastTxt"
     $lblLast.AutoSize = $true
     $lblLast.ForeColor = [System.Drawing.Color]::FromArgb(96, 96, 96)
-    $lblLast.Location = New-Object System.Drawing.Point(28, 155)
-    $tabUpdates.Controls.Add($lblLast)
+    $lblLast.Location = New-Object System.Drawing.Point(16, 120)
+    $gbU.Controls.Add($lblLast)
 
     $btnCheckNow = New-Object System.Windows.Forms.Button
     $btnCheckNow.Text = 'Check for updates now'
     $btnCheckNow.Size = New-Object System.Drawing.Size(200, 30)
-    $btnCheckNow.Location = New-Object System.Drawing.Point(28, 190)
+    $btnCheckNow.Location = New-Object System.Drawing.Point(16, 156)
+    $gbU.Controls.Add($btnCheckNow)
+    $tt.SetToolTip($btnCheckNow, "Force a check right now, regardless of the frequency setting.")
+
     $btnCheckNow.Add_Click({
         $btnCheckNow.Enabled = $false
         $btnCheckNow.Text = 'Checking...'
@@ -1865,31 +2034,120 @@ function Show-SettingsDialog {
             $btnCheckNow.Text = 'Check for updates now'
         }
     })
-    $tabUpdates.Controls.Add($btnCheckNow)
 
     if ($settings.Updates.SkippedVersion) {
         $lblSkipped = New-Object System.Windows.Forms.Label
         $lblSkipped.Text = "Skipped version: $($settings.Updates.SkippedVersion)"
         $lblSkipped.AutoSize = $true
         $lblSkipped.ForeColor = [System.Drawing.Color]::FromArgb(96, 96, 96)
-        $lblSkipped.Location = New-Object System.Drawing.Point(28, 235)
-        $tabUpdates.Controls.Add($lblSkipped)
+        $lblSkipped.Location = New-Object System.Drawing.Point(230, 162)
+        $gbU.Controls.Add($lblSkipped)
 
         $btnUnskip = New-Object System.Windows.Forms.Button
-        $btnUnskip.Text = 'Clear skipped version'
-        $btnUnskip.Size = New-Object System.Drawing.Size(170, 26)
-        $btnUnskip.Location = New-Object System.Drawing.Point(28, 258)
+        $btnUnskip.Text = 'Clear'
+        $btnUnskip.Size = New-Object System.Drawing.Size(70, 24)
+        $btnUnskip.Location = New-Object System.Drawing.Point(380, 158)
+        $gbU.Controls.Add($btnUnskip)
+        $tt.SetToolTip($btnUnskip, "Clear the 'skip this version' flag so update prompts come back.")
+
         $btnUnskip.Add_Click({
             $settings.Updates.SkippedVersion = ''
             Save-Settings -Settings $settings
             $btnUnskip.Visible = $false; $lblSkipped.Visible = $false
         })
-        $tabUpdates.Controls.Add($btnUnskip)
     }
+
+    # ---------- Registrations tab ----------
+    $tabRegs = New-Object System.Windows.Forms.TabPage
+    $tabRegs.Text = '  Registrations  '
+    $tabRegs.BackColor = [System.Drawing.Color]::White
+    $tabs.TabPages.Add($tabRegs)
+
+    $lvRegs = New-Object System.Windows.Forms.ListView
+    $lvRegs.Location = New-Object System.Drawing.Point(16, 14)
+    $lvRegs.Size = New-Object System.Drawing.Size(556, 380)
+    $lvRegs.View = 'Details'
+    $lvRegs.FullRowSelect = $true
+    $lvRegs.GridLines = $true
+    $lvRegs.MultiSelect = $false
+    [void]$lvRegs.Columns.Add('Name', 180)
+    [void]$lvRegs.Columns.Add('Vendor', 110)
+    [void]$lvRegs.Columns.Add('Version', 80)
+    [void]$lvRegs.Columns.Add('Status', 70)
+    [void]$lvRegs.Columns.Add('Path', 700)
+    $tabRegs.Controls.Add($lvRegs)
+    $tt.SetToolTip($lvRegs, "Programs WinRegister has registered. Select one and click Unregister, or double-click the row to open its containing folder.")
+
+    function Refresh-RegList {
+        $lvRegs.BeginUpdate()
+        $lvRegs.Items.Clear()
+        $store = Get-RegistrationStore
+        foreach ($k in $store.Keys) {
+            $e = $store[$k]
+            $name   = Get-SafeProperty $e 'DisplayName' -Default '(unnamed)'
+            $path   = Get-SafeProperty $e 'ExePath' -Default '?'
+            $vendor = Get-SafeProperty $e 'Vendor' -Default ''
+            $ver    = Get-SafeProperty $e 'Version' -Default ''
+            $alive  = if ($path -ne '?' -and (Test-Path -LiteralPath $path)) { 'OK' } else { 'MISSING' }
+            $row = New-Object System.Windows.Forms.ListViewItem $name
+            [void]$row.SubItems.Add($vendor)
+            [void]$row.SubItems.Add($ver)
+            [void]$row.SubItems.Add($alive)
+            [void]$row.SubItems.Add($path)
+            $row.Tag = $path
+            if ($alive -eq 'MISSING') { $row.ForeColor = [System.Drawing.Color]::FromArgb(180, 0, 0) }
+            [void]$lvRegs.Items.Add($row)
+        }
+        $lvRegs.EndUpdate()
+    }
+    Refresh-RegList
+
+    $lvRegs.Add_DoubleClick({
+        if ($lvRegs.SelectedItems.Count -gt 0) {
+            $p = "$($lvRegs.SelectedItems[0].Tag)"
+            if ($p -and (Test-Path -LiteralPath $p)) {
+                try { Start-Process explorer.exe ("/select,`"$p`"") } catch { }
+            }
+        }
+    })
+
+    $btnUnreg = New-Object System.Windows.Forms.Button
+    $btnUnreg.Text = 'Unregister selected'
+    $btnUnreg.Size = New-Object System.Drawing.Size(160, 28)
+    $btnUnreg.Location = New-Object System.Drawing.Point(16, 404)
+    $tabRegs.Controls.Add($btnUnreg)
+    $tt.SetToolTip($btnUnreg, "Removes the selected program's registration. The executable itself stays put.")
+    $btnUnreg.Add_Click({
+        if ($lvRegs.SelectedItems.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('Select a program first.', 'WinRegister', 'OK', 'Information') | Out-Null
+            return
+        }
+        $p = "$($lvRegs.SelectedItems[0].Tag)"
+        $name = "$($lvRegs.SelectedItems[0].Text)"
+        if (Show-ConfirmYesNo -Title 'Unregister' -Message "Unregister '$name'?") {
+            Invoke-Unregister -InputPath $p -SkipConfirm
+            Refresh-RegList
+        }
+    })
+
+    $btnRepair = New-Object System.Windows.Forms.Button
+    $btnRepair.Text = 'Repair (clean dead entries)'
+    $btnRepair.Size = New-Object System.Drawing.Size(190, 28)
+    $btnRepair.Location = New-Object System.Drawing.Point(186, 404)
+    $tabRegs.Controls.Add($btnRepair)
+    $tt.SetToolTip($btnRepair, "Removes entries whose target exe no longer exists, and recreates missing Start Menu shortcuts for live entries.")
+    $btnRepair.Add_Click({ Invoke-Repair; Refresh-RegList })
+
+    $btnRefresh = New-Object System.Windows.Forms.Button
+    $btnRefresh.Text = 'Refresh'
+    $btnRefresh.Size = New-Object System.Drawing.Size(80, 28)
+    $btnRefresh.Location = New-Object System.Drawing.Point(492, 404)
+    $tabRegs.Controls.Add($btnRefresh)
+    $btnRefresh.Add_Click({ Refresh-RegList })
 
     # ---------- About tab ----------
     $tabAbout = New-Object System.Windows.Forms.TabPage
-    $tabAbout.Text = 'About'
+    $tabAbout.Text = '  About  '
     $tabAbout.BackColor = [System.Drawing.Color]::White
     $tabs.TabPages.Add($tabAbout)
 
@@ -1910,41 +2168,79 @@ function Show-SettingsDialog {
     $aboutLink = New-Object System.Windows.Forms.LinkLabel
     $aboutLink.Text = $script:Cfg.HomepageUrl
     $aboutLink.AutoSize = $true
-    $aboutLink.Location = New-Object System.Drawing.Point(20, 130)
+    $aboutLink.Location = New-Object System.Drawing.Point(20, 120)
     $aboutLink.Add_LinkClicked({ try { Start-Process $script:Cfg.HomepageUrl } catch { } })
     $tabAbout.Controls.Add($aboutLink)
 
     $aboutPub = New-Object System.Windows.Forms.Label
-    $aboutPub.Text = "Publisher: $($script:Cfg.Publisher)"
+    $aboutPub.Text = "Publisher: $($script:Cfg.Publisher)        License: MIT"
     $aboutPub.AutoSize = $true
-    $aboutPub.Location = New-Object System.Drawing.Point(20, 160)
+    $aboutPub.Location = New-Object System.Drawing.Point(20, 150)
     $tabAbout.Controls.Add($aboutPub)
 
-    $aboutLicense = New-Object System.Windows.Forms.Label
-    $aboutLicense.Text = 'License: MIT'
-    $aboutLicense.AutoSize = $true
-    $aboutLicense.Location = New-Object System.Drawing.Point(20, 185)
-    $tabAbout.Controls.Add($aboutLicense)
+    $gbPaths = New-Group -Parent $tabAbout -Text 'File locations' -X 16 -Y 190 -W 556 -H 200
+    foreach ($row in @(
+        @{ Label = 'Settings'; Path = $script:Cfg.SettingsFile; CanOpen = $true; Y = 25 }
+        @{ Label = 'Log file'; Path = $script:Cfg.LogFile;      CanOpen = $true; Y = 57 }
+        @{ Label = 'Database'; Path = $script:Cfg.RegistryFile; CanOpen = $false; Y = 89 }
+        @{ Label = 'Script';   Path = $script:Cfg.InstalledScript; CanOpen = $false; Y = 121 }
+        @{ Label = 'Data dir'; Path = $script:Cfg.DataFolder;   CanOpen = $true; Y = 153 }
+    )) {
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = $row.Label + ':'
+        $lbl.AutoSize = $true
+        $lbl.Location = New-Object System.Drawing.Point(16, ($row.Y + 3))
+        $gbPaths.Controls.Add($lbl)
 
-    # Footer buttons
+        $tb = New-Object System.Windows.Forms.TextBox
+        $tb.Text = $row.Path
+        $tb.ReadOnly = $true
+        $tb.Location = New-Object System.Drawing.Point(85, $row.Y)
+        $tb.Size = New-Object System.Drawing.Size(360, 24)
+        $tb.BackColor = [System.Drawing.Color]::White
+        $gbPaths.Controls.Add($tb)
+
+        if ($row.CanOpen) {
+            $tgt = $row.Path
+            $btn = New-Object System.Windows.Forms.Button
+            $btn.Text = 'Open'
+            $btn.Size = New-Object System.Drawing.Size(70, 24)
+            $btn.Location = New-Object System.Drawing.Point(452, ($row.Y - 1))
+            $btn.Tag = $tgt
+            $btn.Add_Click({
+                $p = "$($this.Tag)"
+                if (-not (Test-Path -LiteralPath $p)) { return }
+                try {
+                    $item = Get-Item -LiteralPath $p
+                    if ($item.PSIsContainer) { Start-Process explorer.exe $p }
+                    else                     { Start-Process notepad.exe $p }
+                } catch { }
+            })
+            $gbPaths.Controls.Add($btn)
+        }
+    }
+
+    # ---------- Footer ----------
     $btnCancel = New-Object System.Windows.Forms.Button
-    $btnCancel.Text = 'Cancel'
+    $btnCancel.Text = '&Cancel'
     $btnCancel.Size = New-Object System.Drawing.Size(100, 32)
-    $btnCancel.Location = New-Object System.Drawing.Point(338, 415)
+    $btnCancel.Location = New-Object System.Drawing.Point(400, 500)
     $btnCancel.DialogResult = 'Cancel'
     $form.Controls.Add($btnCancel)
     $form.CancelButton = $btnCancel
+    $tt.SetToolTip($btnCancel, "Close without saving changes.")
 
     $btnSave = New-Object System.Windows.Forms.Button
-    $btnSave.Text = 'Save'
+    $btnSave.Text = '&Save'
     $btnSave.Size = New-Object System.Drawing.Size(100, 32)
-    $btnSave.Location = New-Object System.Drawing.Point(448, 415)
+    $btnSave.Location = New-Object System.Drawing.Point(508, 500)
     $btnSave.DialogResult = 'OK'
     $btnSave.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
     $btnSave.ForeColor = [System.Drawing.Color]::White
     $btnSave.FlatStyle = 'Flat'; $btnSave.FlatAppearance.BorderSize = 0
     $form.Controls.Add($btnSave)
     $form.AcceptButton = $btnSave
+    $tt.SetToolTip($btnSave, "Save preferences and close.")
 
     $form.Add_Shown({
         $form.TopMost = $false; $form.TopMost = $true
@@ -1953,24 +2249,31 @@ function Show-SettingsDialog {
 
     $result = $form.ShowDialog()
     if ($result -eq 'OK') {
-        $settings.Confirmation.AskOnRegister   = $cbAskReg.Checked
-        $settings.Confirmation.AskOnUnregister = $cbAskUnreg.Checked
-        $settings.Notifications.ShowOnRegister   = $cbNotifReg.Checked
-        $settings.Notifications.ShowOnUnregister = $cbNotifUnreg.Checked
-        $settings.Registration.AutoDetectPrimaryExe = $cbAutoExe.Checked
-        $settings.Updates.CheckEnabled = $cbUpdates.Checked
-        $settings.Updates.CheckFrequencyDays = [int]$numFreq.Value
+        $settings.Confirmation.AskOnRegister         = $cbAskReg.Checked
+        $settings.Confirmation.AskOnUnregister       = $cbAskUnreg.Checked
+        $settings.Notifications.ShowOnRegister       = $cbNotifReg.Checked
+        $settings.Notifications.ShowOnUnregister     = $cbNotifUnreg.Checked
+        $settings.Registration.AutoDetectPrimaryExe  = $cbAutoExe.Checked
+        $settings.Registration.StartMenuSubfolder    = $txtSub.Text.Trim()
+        $settings.Registration.FolderScanDepth       = [int]$numDepth.Value
+        $settings.Registration.ExtraBlacklist        = @(($txtBL.Text -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $settings.Updates.CheckEnabled               = $cbUpdates.Checked
+        $settings.Updates.CheckFrequencyDays         = [int]$numFreq.Value
         Save-Settings -Settings $settings
     }
     $form.Dispose()
     if ($result -eq 'Retry') {
-        # Reset-Settings was called - re-open the dialog to show new defaults
         Show-SettingsDialog
     }
 }
 
+
 function Invoke-PurgeAllRegistrations {
-    # Used by the "Clear all" button in Settings.
+    # Used by the "Clear all" button in Settings. Snapshots the current
+    # registrations.json before mutation so the user can roll back via the
+    # .bak file under %LOCALAPPDATA%\WinRegister if they hit this by mistake.
+    Backup-File -Path $script:Cfg.RegistryFile -Tag 'purge' | Out-Null
+
     $store = Get-RegistrationStore
     foreach ($key in @($store.Keys)) {
         $entry = $store[$key]
@@ -2003,11 +2306,14 @@ function Invoke-Register {
     Write-Log "===== Register requested: $InputPath ====="
 
     $settings = Get-Settings
+    $extraBlacklist = @(Get-SafeProperty $settings.Registration 'ExtraBlacklist' -Default @())
+    $folderDepth    = [int](Get-SafeProperty $settings.Registration 'FolderScanDepth' -Default 4)
+    if ($folderDepth -lt 1) { $folderDepth = 4 }
 
     try {
         $exePath = $null
         try {
-            $exePath = Resolve-Target -Path $InputPath
+            $exePath = Resolve-Target -Path $InputPath -MaxFolderDepth $folderDepth
         } catch {
             Show-ErrorDialog "Could not identify a program to register.`n`n$($_.Exception.Message)"
             Write-Log "Resolve-Target failed: $_" -Level Error
@@ -2027,8 +2333,8 @@ function Invoke-Register {
         }
 
         $base = [System.IO.Path]::GetFileNameWithoutExtension($exePath)
-        if (Test-IsBlacklisted -ExeBaseName $base) {
-            Show-ErrorDialog "This file looks like an installer, uninstaller, or helper binary and won't be registered:`n$exePath"
+        if (Test-IsBlacklisted -ExeBaseName $base -ExtraPatterns $extraBlacklist) {
+            Show-ErrorDialog "This file looks like an installer, uninstaller, or helper binary and won't be registered:`n$exePath`n`nYou can add or remove patterns under Settings > Registration > Custom blacklist."
             Write-Log "Blacklisted: $exePath" -Level Warn
             return
         }
@@ -2075,10 +2381,23 @@ function Invoke-Register {
 
         $appId = New-AppId -DisplayName $meta.DisplayName -ExePath $meta.ExePath
         $shortcutFileName = Get-SafeFilename -Text $meta.DisplayName -Fallback $meta.BaseName
-        $shortcutPath = Join-Path $script:Cfg.StartMenuFolder "$shortcutFileName.lnk"
+
+        # Optional custom Start Menu subfolder ("WinRegister", "Portable Apps", etc.)
+        $subfolder = Get-SafeProperty $settings.Registration 'StartMenuSubfolder' -Default ''
+        $startMenuDir = if ($subfolder) {
+            $safeSub = Get-SafeFilename -Text $subfolder -Fallback 'Apps'
+            $dir = Join-Path $script:Cfg.StartMenuFolder $safeSub
+            if (-not (Test-Path -LiteralPath $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            }
+            $dir
+        } else {
+            $script:Cfg.StartMenuFolder
+        }
+        $shortcutPath = Join-Path $startMenuDir "$shortcutFileName.lnk"
 
         if ((Test-Path -LiteralPath $shortcutPath) -and -not $existing) {
-            $shortcutPath = Join-Path $script:Cfg.StartMenuFolder "$shortcutFileName ($($meta.BaseName)).lnk"
+            $shortcutPath = Join-Path $startMenuDir "$shortcutFileName ($($meta.BaseName)).lnk"
         }
 
         # Critical step: shortcut. Fail hard if this fails.
@@ -2620,6 +2939,113 @@ function Uninstall-WinRegister {
 
 #region Help ------------------------------------------------------------------
 
+function Invoke-SelfTest {
+    # Internal verification suite. Exercises every subsystem against a
+    # throwaway test exe, then cleans up. Returns 0 on success, 1 on any failure.
+    # Useful when shipping a new build or diagnosing a confused install.
+    #
+    # Counters live in a hashtable because PowerShell nested functions can read
+    # parent locals but writes default to local scope - a hashtable is mutated
+    # by reference and avoids the trap.
+    $state = @{ Passed = 0; Total = 0; Errors = @() }
+
+    function Test-Step {
+        param([string]$Name, [scriptblock]$Block)
+        $state.Total++
+        try {
+            $r = & $Block
+            if ($r -eq $false) { throw "returned false" }
+            $state.Passed++
+            Write-Host ("  [OK]   {0}" -f $Name) -ForegroundColor Green
+        } catch {
+            $state.Errors += "$Name : $($_.Exception.Message)"
+            Write-Host ("  [FAIL] {0} - {1}" -f $Name, $_.Exception.Message) -ForegroundColor Red
+        }
+    }
+
+    Write-Host ""
+    Write-Host "WinRegister self-test v$($script:Cfg.Version)" -ForegroundColor Cyan
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host ""
+
+    # 1. Native helpers compile + PE detection
+    Test-Step 'Initialize-Native compiles' { Initialize-Native; [WinRegister.Native] -as [type] -ne $null }
+    Test-Step 'PE subsystem: notepad.exe = GUI(2)' { (Get-PESubsystem -Path "$env:WINDIR\System32\notepad.exe") -eq 2 }
+    Test-Step 'PE subsystem: cmd.exe = CUI(3)'    { (Get-PESubsystem -Path "$env:WINDIR\System32\cmd.exe") -eq 3 }
+    Test-Step 'PE subsystem: this script = invalid(0)' {
+        $me = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+        (Get-PESubsystem -Path $me) -eq 0
+    }
+
+    # 2. Identifier helpers
+    Test-Step 'ConvertTo-PascalCase: "r2 mod manager" => "R2ModManager"' {
+        (ConvertTo-PascalCase 'r2 mod manager') -eq 'R2ModManager'
+    }
+    Test-Step 'ConvertTo-PascalCase empty => "App"' { (ConvertTo-PascalCase '') -eq 'App' }
+    Test-Step 'New-AppId is stable per path' {
+        $a = New-AppId -DisplayName 'T' -ExePath 'C:\X\t.exe'
+        $b = New-AppId -DisplayName 'T' -ExePath 'C:\X\t.exe'
+        $a -eq $b
+    }
+    Test-Step 'New-AppId differs across paths' {
+        $a = New-AppId -DisplayName 'T' -ExePath 'C:\X\t.exe'
+        $b = New-AppId -DisplayName 'T' -ExePath 'D:\Y\t.exe'
+        $a -ne $b
+    }
+
+    # 3. Settings round-trip
+    $sf = $script:Cfg.SettingsFile
+    $sfBackup = if (Test-Path $sf) { Backup-File -Path $sf -Tag 'selftest' } else { $null }
+    Test-Step 'Settings: defaults are valid' {
+        $s = Get-DefaultSettings
+        ($s.Confirmation.AskOnRegister -eq $true) -and ($s.Updates.CheckEnabled -eq $true)
+    }
+    Test-Step 'Settings: save+load round-trips' {
+        $s = Get-DefaultSettings
+        $s.Confirmation.AskOnRegister = $false
+        Save-Settings -Settings $s
+        (Get-Settings).Confirmation.AskOnRegister -eq $false
+    }
+
+    # 4. Blacklist refinements
+    Test-Step 'Blacklist accepts r2modman'      { -not (Test-IsBlacklisted -ExeBaseName 'r2modman') }
+    Test-Step 'Blacklist accepts python (portable)' { -not (Test-IsBlacklisted -ExeBaseName 'python') }
+    Test-Step 'Blacklist rejects setup'         { Test-IsBlacklisted -ExeBaseName 'setup' }
+    Test-Step 'Blacklist rejects unins000'      { Test-IsBlacklisted -ExeBaseName 'unins000' }
+    Test-Step 'Blacklist honors ExtraPatterns'  { Test-IsBlacklisted -ExeBaseName 'badtool' -ExtraPatterns @('badtool') }
+
+    # 5. End-to-end register + unregister with a real binary
+    $tempDir = Join-Path $env:TEMP "WinRegister-SelfTest-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+    $tempExe = Join-Path $tempDir 'SelfTestApp.exe'
+    Copy-Item "$env:WINDIR\System32\notepad.exe" $tempExe
+    $aumid = New-AppId -DisplayName 'SelfTest App' -ExePath $tempExe
+
+    Test-Step 'Register: produces shortcut + ARP entry' {
+        Invoke-Register -InputPath $tempExe -OverrideName 'SelfTest App' -SkipConfirm
+        $store = Get-RegistrationStore
+        $hit = $store.Keys | Where-Object { (Get-SafeProperty $store[$_] 'ExePath') -ieq $tempExe }
+        if (-not $hit) { return $false }
+        Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$aumid"
+    }
+    Test-Step 'Unregister: removes shortcut + ARP entry' {
+        Invoke-Unregister -InputPath $tempExe -SkipConfirm
+        -not (Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$aumid")
+    }
+
+    # Cleanup
+    Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($sfBackup -and (Test-Path $sfBackup)) {
+        Copy-Item -LiteralPath $sfBackup -Destination $sf -Force
+        Remove-Item -LiteralPath $sfBackup -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host ""
+    Write-Host ("Result: {0} passed, {1} failed" -f $state.Passed, $state.Errors.Count) -ForegroundColor $(if ($state.Errors.Count -eq 0){'Green'}else{'Red'})
+    Write-Host ""
+    if ($state.Errors.Count -gt 0) { exit 1 }
+}
+
 function Show-Help {
     Write-Host ""
     Write-Host "WinRegister v$($script:Cfg.Version)" -ForegroundColor Cyan
@@ -2634,6 +3060,8 @@ function Show-Help {
     Write-Host "  .\WinRegister.ps1 -CheckUpdate              Check for a newer release now" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -Repair                   Heal dead entries / rebuild missing shortcuts" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -Doctor                   Diagnostic snapshot of install + registrations" -ForegroundColor Gray
+    Write-Host "  .\WinRegister.ps1 -SelfTest                 Run internal verification suite" -ForegroundColor Gray
+    Write-Host "  .\WinRegister.ps1 -Version                  Print version and exit" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -Uninstall                Remove the right-click entries" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -Uninstall -Purge         Also remove every registration" -ForegroundColor Gray
     Write-Host ""
@@ -2670,6 +3098,8 @@ try {
         'Repair'     { Invoke-Repair }
         'Doctor'     { Invoke-Doctor }
         'Settings'   { Show-SettingsDialog }
+        'Version'    { Write-Host $script:Cfg.Version }
+        'SelfTest'   { Invoke-SelfTest }
         'CheckUpdate' {
             # NOTE: must not use $settings here - it collides case-insensitively
             # with the script param [switch]$Settings and triggers a switch-cast error.
