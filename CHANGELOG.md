@@ -4,6 +4,26 @@ All notable changes to WinRegister are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.2] - 2026-05-12
+
+### Added
+- **Inno Setup installer.** Releases now ship `WinRegister-Setup-x.y.z.exe`,
+  a one-click installer that handles file copy, context-menu wiring,
+  Start Menu shortcuts, and Apps & Features registration. Per-user, no admin
+  prompt, no console window, no extract step.
+- **GitHub Actions release workflow** (`.github/workflows/release.yml`)
+  auto-builds the installer on every `v*` tag push and attaches it to the
+  GitHub release, alongside a source ZIP for power users.
+- `-SkipSelfArp` switch on `-Install`. When set, the script does not write
+  its own HKCU Uninstall entry — used by the Inno installer so Inno's
+  native Apps & Features entry is the canonical one (no double entries).
+
+### Changed
+- README install section rewritten: lead with the one-click installer; ZIP
+  install is now in a collapsible "power-user" section.
+- "Right-click → Properties → Unblock" step removed from documentation; the
+  installer is the supported path and has no Mark-of-the-Web issue.
+
 ## [1.2.1] - 2026-05-12
 
 ### Changed
@@ -95,6 +115,7 @@ versioning follows [Semantic Versioning](https://semver.org/).
 - Inline C# `IShellLink`/`IPropertyStore` COM interop.
 - Persistent registration store at `%LOCALAPPDATA%\WinRegister\registrations.json`.
 
+[1.2.2]: https://github.com/trustxix/winregister/releases/tag/v1.2.2
 [1.2.1]: https://github.com/trustxix/winregister/releases/tag/v1.2.1
 [1.2.0]: https://github.com/trustxix/winregister/releases/tag/v1.2.0
 [1.1.0]: https://github.com/trustxix/winregister/releases/tag/v1.1.0

@@ -1,0 +1,110 @@
+name: Build & Release Installer
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (no leading v)'
+        required: true
+        default: '0.0.0-dev'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build installer on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $v = $env:GITHUB_REF -replace '^refs/tags/v', ''
+          } else {
+            $v = '${{ github.event.inputs.version }}'
+          }
+          if (-not $v) { $v = '0.0.0-dev' }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Building WinRegister v$v"
+
+      - name: Verify version in WinRegister.ps1 matches tag
+        shell: pwsh
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $found = (Get-Content WinRegister.ps1 -Raw) -match "Version\s*=\s*'([^']+)'"
+          if (-not $found) {
+            Write-Error "Could not find Version in WinRegister.ps1"
+            exit 1
+          }
+          $scriptVer = $Matches[1]
+          if ($scriptVer -ne $v) {
+            Write-Error "Tag version ($v) does not match WinRegister.ps1 Version ($scriptVer). Bump the script's Cfg.Version first."
+            exit 1
+          }
+          Write-Host "OK: WinRegister.ps1 Version = $scriptVer"
+
+      - name: PowerShell syntax check
+        shell: pwsh
+        run: |
+          $tokens = $null; $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path WinRegister.ps1).Path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host "L$($_.Extent.StartLineNumber): $($_.Message)" }
+            exit 1
+          }
+          Write-Host "OK: parses cleanly"
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile installer
+        shell: pwsh
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc "/DAppVersion=$v" installer\winregister.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host ""
+          Write-Host "Produced:"
+          Get-ChildItem installer\output
+
+      - name: Build source ZIP fallback
+        shell: pwsh
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          New-Item -ItemType Directory -Path pack -Force | Out-Null
+          Copy-Item WinRegister.ps1, README.md, CHANGELOG.md, LICENSE pack\
+          Compress-Archive -Path pack\* -DestinationPath "WinRegister-$v-source.zip" -Force
+          Get-ChildItem "WinRegister-$v-source.zip"
+
+      - name: Upload artifacts (for non-release runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinRegister-${{ steps.ver.outputs.version }}
+          path: |
+            installer/output/WinRegister-Setup-${{ steps.ver.outputs.version }}.exe
+            WinRegister-${{ steps.ver.outputs.version }}-source.zip
+
+      - name: Attach to GitHub release (for tag pushes)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer/output/WinRegister-Setup-${{ steps.ver.outputs.version }}.exe
+            WinRegister-${{ steps.ver.outputs.version }}-source.zip
+          fail_on_unmatched_files: true

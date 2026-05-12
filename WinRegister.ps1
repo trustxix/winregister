@@ -97,6 +97,11 @@ param(
     [Parameter(ParameterSetName = 'Install', Mandatory)]
     [switch]$Install,
 
+    # When set, the script will not write its own Apps & Features entry -
+    # used by the Inno Setup installer so its native ARP entry is canonical.
+    [Parameter(ParameterSetName = 'Install')]
+    [switch]$SkipSelfArp,
+
     [Parameter(ParameterSetName = 'Uninstall', Mandatory)]
     [switch]$Uninstall,
 
@@ -137,7 +142,7 @@ $ErrorActionPreference = 'Stop'
 #region Configuration ----------------------------------------------------------
 
 $script:Cfg = [pscustomobject]@{
-    Version              = '1.2.1'
+    Version              = '1.2.2'
     SchemaVersion        = 2
     SettingsSchemaVersion= 1
     AppName              = 'WinRegister'
@@ -2446,7 +2451,8 @@ function Remove-SelfStartMenuShortcuts {
 }
 
 function Install-WinRegister {
-    Write-Log "===== Install requested ====="
+    param([switch]$SkipSelfArp)
+    Write-Log "===== Install requested (SkipSelfArp=$SkipSelfArp) ====="
     Initialize-DataFolder
     Initialize-SettingsFolder
 
@@ -2525,8 +2531,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$($script:Cfg.Installed
     }
 
     # Self-register so the user can uninstall WinRegister from Settings > Apps
-    # like any other program.
-    try { Register-SelfInArp } catch { Write-Log "Self-ARP failed (non-fatal): $_" -Level Warn }
+    # like any other program. Skipped when invoked by Inno Setup (which writes
+    # its own ARP entry per the installer's standard mechanism).
+    if (-not $SkipSelfArp) {
+        try { Register-SelfInArp } catch { Write-Log "Self-ARP failed (non-fatal): $_" -Level Warn }
+    } else {
+        Write-Log "Self-ARP skipped (-SkipSelfArp specified)."
+    }
 
     # Start Menu shortcuts for the Settings UI and update check.
     try { New-SelfStartMenuShortcuts } catch { Write-Log "Self Start Menu shortcut failed (non-fatal): $_" -Level Warn }
@@ -2653,7 +2664,7 @@ try {
             Invoke-StartupUpdateCheck
             Invoke-Unregister -InputPath $Unregister -SkipConfirm:$ForceUnregister
         }
-        'Install'    { Install-WinRegister }
+        'Install'    { Install-WinRegister -SkipSelfArp:$SkipSelfArp }
         'Uninstall'  { Uninstall-WinRegister }
         'List'       { Show-RegistrationList }
         'Repair'     { Invoke-Repair }

@@ -13,17 +13,29 @@ WinRegister fixes that with a single right-click.
 
 ## Install
 
-1. Download the latest release ZIP from
-   [Releases](https://github.com/trustxix/winregister/releases) and extract it
-   anywhere.
-2. Right-click the extracted folder, choose **Properties**, and tick **Unblock**
-   under the *Security* section (Windows marks downloaded files as untrusted; this
-   one click removes the warning across all files in the folder). Then click OK.
-3. Double-click **`Install.cmd`**.
-4. Done — no admin prompt, no system-wide changes.
+1. Grab **`WinRegister-Setup-x.y.z.exe`** from the
+   [latest release](https://github.com/trustxix/winregister/releases/latest).
+2. Double-click it.
+3. Done. No admin prompt, no extracting, no console window.
 
-To remove it later: double-click **`Uninstall.cmd`** in the same folder, or
-use *Settings > Apps > WinRegister > Uninstall* like any other Windows app.
+> The first time you run it, Windows may show a "Windows protected your PC"
+> dialog because the installer isn't yet code-signed. Click **More info → Run
+> anyway**. This is the same one-time hurdle every unsigned indie tool faces
+> until SmartScreen builds a reputation for the binary.
+
+**To uninstall**: Settings → Apps → WinRegister → Uninstall.
+
+<details>
+<summary>Power-user install (ZIP)</summary>
+
+If you'd rather not run an installer, download the
+`WinRegister-x.y.z-source.zip` from the same release page, extract anywhere,
+then run from PowerShell:
+
+```
+powershell -ExecutionPolicy Bypass -File .\WinRegister.ps1 -Install
+```
+</details>
 
 ## Use
 
