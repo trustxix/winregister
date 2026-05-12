@@ -14,7 +14,7 @@ WinRegister fixes that with a single right-click.
 ## Install
 
 1. Download the latest release ZIP from
-   [Releases](https://github.com/trustxix/windows-config/releases) and extract it
+   [Releases](https://github.com/trustxix/winregister/releases) and extract it
    anywhere.
 2. Right-click the extracted folder, choose **Properties**, and tick **Unblock**
    under the *Security* section (Windows marks downloaded files as untrusted; this
@@ -104,10 +104,10 @@ on a hot path.
 ## Privacy
 
 Zero telemetry. WinRegister makes exactly one outbound request, only when an
-update check is due, only to `api.github.com/repos/trustxix/windows-config/releases/latest`,
+update check is due, only to `api.github.com/repos/trustxix/winregister/releases/latest`,
 and only to read the latest tag and release notes. No identifiers, no analytics,
 no third-party endpoints.
 
 ## License
 
-MIT. See [LICENSE](../LICENSE).
+MIT. See [LICENSE](LICENSE).

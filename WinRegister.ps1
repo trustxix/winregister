@@ -137,13 +137,13 @@ $ErrorActionPreference = 'Stop'
 #region Configuration ----------------------------------------------------------
 
 $script:Cfg = [pscustomobject]@{
-    Version              = '1.2.0'
+    Version              = '1.2.1'
     SchemaVersion        = 2
     SettingsSchemaVersion= 1
     AppName              = 'WinRegister'
     Publisher            = 'trustxix'
-    HomepageUrl          = 'https://github.com/trustxix/windows-config'
-    UpdateApiUrl         = 'https://api.github.com/repos/trustxix/windows-config/releases/latest'
+    HomepageUrl          = 'https://github.com/trustxix/winregister'
+    UpdateApiUrl         = 'https://api.github.com/repos/trustxix/winregister/releases/latest'
     StartMenuFolder      = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
     SelfStartMenuFolder  = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\WinRegister'
     DataFolder           = Join-Path $env:LOCALAPPDATA 'WinRegister'

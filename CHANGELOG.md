@@ -4,6 +4,25 @@ All notable changes to WinRegister are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-05-12
+
+### Changed
+- **Moved to its own repository: `trustxix/winregister`.** Previously
+  distributed from `trustxix/windows-config` which is private; the split
+  allows the update checker, downloads, and issue tracker to work for
+  everyone without GitHub authentication.
+- `Cfg.UpdateApiUrl` and `Cfg.HomepageUrl` now point at the new public repo.
+
+### Fixed
+- Update checker no longer silently shows "you're on the latest version"
+  when the API actually returned 404 / network error. Now distinguishes
+  `UpdateAvailable` / `UpToDate` / `CheckFailed` and shows the correct
+  dialog for each.
+- Case-insensitive PowerShell collision between the script-level
+  `[switch]$Settings` parameter and a dispatcher-local `$settings` variable
+  was producing `Cannot convert PSCustomObject to SwitchParameter` on
+  `-CheckUpdate`. Renamed the local to `$prefs`.
+
 ## [1.2.0] - 2026-05-12
 
 ### Added
@@ -76,6 +95,7 @@ versioning follows [Semantic Versioning](https://semver.org/).
 - Inline C# `IShellLink`/`IPropertyStore` COM interop.
 - Persistent registration store at `%LOCALAPPDATA%\WinRegister\registrations.json`.
 
-[1.2.0]: https://github.com/trustxix/windows-config/releases/tag/v1.2.0
-[1.1.0]: https://github.com/trustxix/windows-config/releases/tag/v1.1.0
-[1.0.0]: https://github.com/trustxix/windows-config/releases/tag/v1.0.0
+[1.2.1]: https://github.com/trustxix/winregister/releases/tag/v1.2.1
+[1.2.0]: https://github.com/trustxix/winregister/releases/tag/v1.2.0
+[1.1.0]: https://github.com/trustxix/winregister/releases/tag/v1.1.0
+[1.0.0]: https://github.com/trustxix/winregister/releases/tag/v1.0.0
