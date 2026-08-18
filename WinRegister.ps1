@@ -29,7 +29,9 @@
 .PARAMETER Install
     One-time setup: copies this script to %LOCALAPPDATA%\WinRegister and adds
     the Explorer right-click "Register with Windows" / "Unregister from Windows"
-    entries.
+    entries. The two entries are mutually exclusive: each item shows only the
+    one that applies to it, driven by an AppliesTo condition that is rewritten
+    whenever a registration is added or removed.
 
 .PARAMETER Uninstall
     Removes the context menu entries. With -Purge, also removes every
@@ -80,6 +82,7 @@
       - App Paths: https://learn.microsoft.com/en-us/windows/win32/shell/app-registration
       - AppUserModelID: https://learn.microsoft.com/en-us/windows/win32/shell/appids
       - Uninstall (ARP): https://learn.microsoft.com/en-us/windows/win32/msi/uninstall-registry-key
+      - Verb AppliesTo: https://learn.microsoft.com/en-us/windows/win32/shell/context-menu-handlers
       - High DPI: https://learn.microsoft.com/en-us/windows/win32/hidpi/high-dpi-desktop-application-development-on-windows
 #>
 
@@ -148,7 +151,7 @@ $ErrorActionPreference = 'Stop'
 #region Configuration ----------------------------------------------------------
 
 $script:Cfg = [pscustomobject]@{
-    Version              = '1.3.0'
+    Version              = '1.4.0'
     SchemaVersion        = 2
     SettingsSchemaVersion= 2
     AppName              = 'WinRegister'
@@ -176,6 +179,22 @@ $script:Cfg = [pscustomobject]@{
     ContextUnregLabel    = 'Unregister from Windows'
     ContextIconRegister  = 'imageres.dll,-5323'
     ContextIconUnregister= 'imageres.dll,-5366'
+    # Conditional verb visibility. AppliesTo holds an Advanced Query Syntax
+    # condition that the shell evaluates against the right-clicked item, which
+    # is the only way to give a static registry verb state-dependent visibility
+    # without an in-process shell extension.
+    #   https://learn.microsoft.com/en-us/windows/win32/shell/context-menu-handlers
+    # Measured on Windows 11 (build 26200) by enumerating real context menus:
+    #   * the condition stops being honoured past ~30,500 characters, and past
+    #     that point it fails CLOSED - a negated condition would hide "Register"
+    #     for every item, registered or not. ConditionMaxChars keeps us well
+    #     under that cliff with room to spare.
+    #   * a malformed condition also fails closed, so we only ever write a
+    #     condition assembled here from quoted literals - never user text.
+    ConditionMaxChars    = 20000
+    # A syntactically valid condition that no real shell item can satisfy, used
+    # to hide "Unregister" when nothing is registered at all.
+    ConditionNeverMatch  = 'System.ItemPathDisplay:="\\\\?\\WinRegister\\__none__"'
     ClassicMenuClsidKey  = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
     ClassicMenuInprocKey = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32'
     ClassicMenuMarker    = Join-Path $env:LOCALAPPDATA 'WinRegister\.classic-menu-owned-by-us'
@@ -1400,6 +1419,144 @@ function Find-RegistrationByExe {
 
 #endregion
 
+#region Conditional context menu ----------------------------------------------
+
+function Get-CanonicalShellPath {
+    # Normalises a stored path into the exact form the shell reports in
+    # System.ItemPathDisplay. Matching is case-insensitive, but it is NOT
+    # forgiving about separators or a trailing backslash, both of which were
+    # measured to break an otherwise-correct condition.
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    $p = $Path.Trim()
+    try { $p = [System.IO.Path]::GetFullPath($p) } catch { }
+    # A drive root is the one path that legitimately keeps its trailing
+    # separator - "D:" is not the same item as "D:\".
+    if ($p -notmatch '^[A-Za-z]:\\$') { $p = $p.TrimEnd('\') }
+    return $p
+}
+
+function Get-RegisteredShellPaths {
+    # Buckets every path that should count as "already registered", keyed by the
+    # shell class whose menu it will filter.
+    #
+    # A folder or shortcut only lands here if the user actually registered
+    # through it (Invoke-Register records SourcePath). We deliberately do not
+    # infer that a registered exe's parent folder is registered too: resolving a
+    # folder runs Find-PrimaryExecutable, which is a heuristic over the folder's
+    # current contents and can legitimately pick a different exe later.
+    $buckets = @{
+        exefile   = [ordered]@{}
+        lnkfile   = [ordered]@{}
+        Directory = [ordered]@{}
+    }
+
+    $store = Get-RegistrationStore
+    foreach ($key in $store.Keys) {
+        $entry = $store[$key]
+        foreach ($field in 'ExePath', 'SourcePath', 'ShortcutPath') {
+            $raw = Get-SafeProperty $entry $field
+            if (-not $raw) { continue }
+
+            $p = Get-CanonicalShellPath -Path $raw
+            if (-not $p) { continue }
+            # Windows paths cannot contain a double quote, so this can only fire
+            # on a corrupted store - but a stray quote would produce malformed
+            # AQS, which fails closed and hides the verb. Skip instead.
+            if ($p.Contains('"')) {
+                Write-Log "Skipping path with a quote character in menu condition: $p" -Level Warn
+                continue
+            }
+
+            # ExePath is always an .exe and ShortcutPath always a .lnk, so only
+            # SourcePath can name a folder - and Resolve-Target accepts nothing
+            # but those three shapes. Classified by extension rather than
+            # Test-Path so a disconnected network path cannot stall the rewrite.
+            $ext = [System.IO.Path]::GetExtension($p).ToLowerInvariant()
+            $class = if ($ext -eq '.lnk') { 'lnkfile' }
+                     elseif ($ext -eq '.exe') { 'exefile' }
+                     elseif ($field -eq 'SourcePath') { 'Directory' }
+                     else { $null }
+
+            if ($class) { $buckets[$class][$p.ToLowerInvariant()] = $p }
+        }
+    }
+    return $buckets
+}
+
+function New-ShellPathCondition {
+    # Joins paths into an AQS disjunction. ':=' is exact equality - measured to
+    # match the whole value only, so "C:\Apps\Tool" never matches "C:\Apps\Tool2".
+    # Quoted literals need no escaping: space ' & ( ) , # [ ] + = ~ @ ! % ^ and
+    # non-ASCII characters were all verified to match correctly inside quotes.
+    param([string[]]$Paths)
+
+    if (-not $Paths -or $Paths.Count -eq 0) { return '' }
+    return (($Paths | ForEach-Object { "System.ItemPathDisplay:=`"$_`"" }) -join ' OR ')
+}
+
+function Set-VerbCondition {
+    param([string]$KeyPath, [string]$Condition)
+
+    if (-not (Test-Path -LiteralPath $KeyPath)) { return }
+    try {
+        if ($Condition) {
+            Set-ItemProperty -LiteralPath $KeyPath -Name 'AppliesTo' -Value $Condition
+        } else {
+            Remove-ItemProperty -LiteralPath $KeyPath -Name 'AppliesTo' -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Write-Log "Could not update AppliesTo on ${KeyPath}: $_" -Level Warn
+    }
+}
+
+function Update-ContextMenuConditions {
+    # Rewrites both verbs' AppliesTo so "Register with Windows" is hidden for
+    # items already registered and "Unregister from Windows" is hidden for
+    # everything else. Called after every change to the registration store.
+    #
+    # Cheap enough to run unconditionally: the shell re-reads AppliesTo on each
+    # menu build, so the next right-click reflects the change with no Explorer
+    # restart and no SHChangeNotify broadcast.
+    try {
+        $buckets = Get-RegisteredShellPaths
+    } catch {
+        # Never let a menu refresh break a registration that already succeeded.
+        Write-Log "Could not read registrations for menu conditions: $_" -Level Warn
+        return
+    }
+
+    foreach ($class in 'exefile', 'lnkfile', 'Directory') {
+        $regKey   = Join-Path $script:Cfg.ContextRoot "$class\shell\$($script:Cfg.ContextVerbId)"
+        $unregKey = Join-Path $script:Cfg.ContextRoot "$class\shell\$($script:Cfg.ContextUnregVerbId)"
+        if (-not (Test-Path -LiteralPath $regKey) -and -not (Test-Path -LiteralPath $unregKey)) {
+            continue
+        }
+
+        $positive = New-ShellPathCondition -Paths @($buckets[$class].Values)
+        $negative = if ($positive) { "NOT ($positive)" } else { '' }
+
+        if ($negative.Length -gt $script:Cfg.ConditionMaxChars) {
+            # Past the shell's limit the condition fails closed, which would
+            # strand the user with no reachable verb at all. Degrading to "both
+            # verbs always visible" is the pre-1.4.0 behaviour: redundant, but
+            # never a dead end.
+            Write-Log ("Menu condition for $class would be $($negative.Length) chars " +
+                       "(cap $($script:Cfg.ConditionMaxChars)); showing both verbs unconditionally.") -Level Warn
+            Set-VerbCondition -KeyPath $regKey   -Condition ''
+            Set-VerbCondition -KeyPath $unregKey -Condition ''
+            continue
+        }
+
+        Set-VerbCondition -KeyPath $regKey -Condition $negative
+        Set-VerbCondition -KeyPath $unregKey -Condition $(
+            if ($positive) { $positive } else { $script:Cfg.ConditionNeverMatch })
+    }
+}
+
+#endregion
+
 #region Registration backend --------------------------------------------------
 
 function New-StartMenuShortcut {
@@ -2289,6 +2446,7 @@ function Invoke-PurgeAllRegistrations {
         param($store)
         @($store.Keys) | ForEach-Object { $store.Remove($_) }
     }
+    Update-ContextMenuConditions
     Write-Log "Purged all registrations via Settings UI."
 }
 
@@ -2448,11 +2606,16 @@ function Invoke-Register {
             Version      = $meta.Version
             InstallSize  = $installSize
             RegisteredAt = (Get-Date).ToString('o')
+            # The path the user actually right-clicked, which for a folder or a
+            # shortcut is not the exe. Recorded so the context menu can tell
+            # that *that* item is registered, not just the resolved binary.
+            SourcePath   = (Get-CanonicalShellPath -Path $InputPath)
         }
         Edit-RegistrationStore {
             param($store)
             $store[$appId] = $newEntry
         }.GetNewClosure()
+        Update-ContextMenuConditions
 
         Write-Log "Registered: $($meta.DisplayName) ($appId)"
         if ($settings.Notifications.ShowOnRegister) {
@@ -2510,6 +2673,7 @@ function Invoke-Unregister {
             param($store)
             $store.Remove($foundId)
         }.GetNewClosure()
+        Update-ContextMenuConditions
 
         Write-Log "Unregistered: $displayName"
         if ($settings.Notifications.ShowOnUnregister) {
@@ -2554,6 +2718,10 @@ function Invoke-Repair {
     Write-Log "===== Repair requested ====="
     $store = Get-RegistrationStore
     if ($store.Count -eq 0) {
+        # Still resync the menu: an emptied or deleted registrations.json is
+        # precisely the case where a stale condition would leave "Unregister"
+        # showing for programs that are no longer tracked.
+        Update-ContextMenuConditions
         Write-Host "Nothing to repair - no registrations." -ForegroundColor Yellow
         return
     }
@@ -2596,6 +2764,9 @@ function Invoke-Repair {
     }
 
     Save-RegistrationStore -Store $store
+    # Also the self-heal path for the menu: rebuilds both conditions from the
+    # live store, so a hand-edited or stale registrations.json corrects itself.
+    Update-ContextMenuConditions
     Write-Host ""
     Write-Host "Repair complete: $ok healthy, $rebuilt rebuilt, $removed removed." -ForegroundColor Green
     Write-Log "Repair: ok=$ok rebuilt=$rebuilt removed=$removed"
@@ -2637,6 +2808,31 @@ function Invoke-Doctor {
             $mark = if ($present) { '[OK]' } else { '[--]' }
             $color = if ($present) { 'Green' } else { 'DarkGray' }
             Write-Host "    $mark $class -> $verb" -ForegroundColor $color
+        }
+    }
+
+    Write-Host ""
+    Write-Host "  Menu visibility conditions:" -ForegroundColor White
+    $buckets = $null
+    try { $buckets = Get-RegisteredShellPaths } catch {
+        Write-Host "    Could not evaluate: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    if ($buckets) {
+        foreach ($class in 'exefile', 'lnkfile', 'Directory') {
+            $key = Join-Path $script:Cfg.ContextRoot "$class\shell\$($script:Cfg.ContextUnregVerbId)"
+            if (-not (Test-Path -LiteralPath $key)) {
+                Write-Host "    [--] $class (verb not installed)" -ForegroundColor DarkGray
+                continue
+            }
+            $cond = Get-SafeProperty (Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue) 'AppliesTo'
+            $count = @($buckets[$class].Values).Count
+            if (-not $cond) {
+                Write-Host "    [!!] $class -> unconditional (both verbs always shown)" -ForegroundColor Yellow
+            } elseif ($cond -eq $script:Cfg.ConditionNeverMatch) {
+                Write-Host "    [OK] $class -> nothing registered; Unregister hidden" -ForegroundColor Green
+            } else {
+                Write-Host "    [OK] $class -> $count path(s), $($cond.Length) chars" -ForegroundColor Green
+            }
         }
     }
 
@@ -2832,6 +3028,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$($script:Cfg.Installed
 
         Write-Log "Wrote context menu for $($t.Class): $base"
     }
+
+    # Seed the visibility conditions from whatever is already registered, so an
+    # upgrade over an existing install gets a correct menu immediately rather
+    # than after the next register/unregister.
+    Update-ContextMenuConditions
 
     # Make our entries appear at the top level of the Win11 right-click menu
     # (no "Show more options" required). Track whether we owned the change.
@@ -3031,6 +3232,52 @@ function Invoke-SelfTest {
     Test-Step 'Unregister: removes shortcut + ARP entry' {
         Invoke-Unregister -InputPath $tempExe -SkipConfirm
         -not (Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$aumid")
+    }
+
+    # 6. Conditional context menu (AppliesTo condition building)
+    Test-Step 'Path canon: folder loses its trailing backslash' {
+        (Get-CanonicalShellPath -Path 'C:\Apps\Tool\') -eq 'C:\Apps\Tool'
+    }
+    Test-Step 'Path canon: drive root keeps its backslash' {
+        (Get-CanonicalShellPath -Path 'D:\') -eq 'D:\'
+    }
+    Test-Step 'Path canon: forward slashes become backslashes' {
+        (Get-CanonicalShellPath -Path 'C:/Apps/Tool/app.exe') -eq 'C:\Apps\Tool\app.exe'
+    }
+    Test-Step 'Condition: empty set yields no condition' {
+        (New-ShellPathCondition -Paths @()) -eq ''
+    }
+    Test-Step 'Condition: uses exact-equality operator' {
+        (New-ShellPathCondition -Paths @('C:\a\b.exe')) -eq 'System.ItemPathDisplay:="C:\a\b.exe"'
+    }
+    Test-Step 'Condition: multiple paths joined with OR' {
+        (New-ShellPathCondition -Paths @('C:\a.exe', 'C:\b.exe')) -eq
+            'System.ItemPathDisplay:="C:\a.exe" OR System.ItemPathDisplay:="C:\b.exe"'
+    }
+    Test-Step 'Condition: special characters need no escaping' {
+        $p = "C:\it's (x) & [y] #1, 100%^~@!+=.exe"
+        (New-ShellPathCondition -Paths @($p)) -eq "System.ItemPathDisplay:=`"$p`""
+    }
+    Test-Step 'Condition: cap stays under the measured 30477-char cliff' {
+        $script:Cfg.ConditionMaxChars -lt 30477
+    }
+    Test-Step 'Buckets: exe, folder and shortcut route to their own classes' {
+        $probe = [ordered]@{
+            'T' = [pscustomobject]@{
+                ExePath      = 'C:\Apps\Tool\tool.exe'
+                SourcePath   = 'C:\Apps\Tool'
+                ShortcutPath = 'C:\SM\Tool.lnk'
+            }
+        }
+        # Get-RegisteredShellPaths reads the store, so drive it through a stub
+        # rather than mutating the user's real registrations.
+        $b = & {
+            function Get-RegistrationStore { $probe }
+            Get-RegisteredShellPaths
+        }
+        (@($b.exefile.Values) -contains 'C:\Apps\Tool\tool.exe') -and
+        (@($b.Directory.Values) -contains 'C:\Apps\Tool') -and
+        (@($b.lnkfile.Values) -contains 'C:\SM\Tool.lnk')
     }
 
     # Cleanup

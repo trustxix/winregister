@@ -45,6 +45,10 @@ After installing:
   `Register with Windows` → confirm the dialog. The app now appears in Windows
   Search within seconds.
 - **Unregister**: Same flow, choose `Unregister from Windows`.
+
+Only one of the two ever shows at a time: something already registered offers
+`Unregister from Windows`, everything else offers `Register with Windows`. The
+menu updates immediately — no Explorer restart or sign-out.
 - **Settings**: `Start Menu → WinRegister → WinRegister Settings`, or run
   `winregister -Settings` from any terminal.
 
@@ -58,6 +62,7 @@ Every registration writes four things (all per-user, all reversible):
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\<exe>` | `Win+R` launching by name |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\<id>` | Visible in *Settings > Apps* with a working uninstall |
 | Tracking record in `%LOCALAPPDATA%\WinRegister\registrations.json` | So unregister/repair work cleanly |
+| `AppliesTo` condition on both context-menu verbs | So each item shows only the entry that applies to it |
 
 Implementation references the Microsoft Win32 specifications directly — see
 the inline comments in `WinRegister.ps1` for citations against the

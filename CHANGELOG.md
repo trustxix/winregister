@@ -4,6 +4,49 @@ All notable changes to WinRegister are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-08-18
+
+### Changed
+- **The two right-click entries are now mutually exclusive.** *Register with
+  Windows* no longer appears on something already registered, and *Unregister
+  from Windows* no longer appears on something that isn't. Previously both
+  showed on everything.
+
+  This works through the shell's `AppliesTo` value, an Advanced Query Syntax
+  condition Explorer evaluates against the right-clicked item — the only way
+  to give a static registry verb state-dependent visibility without loading a
+  shell extension into `explorer.exe`. The condition is rewritten after every
+  register, unregister, repair and purge, so the next right-click is already
+  correct: no Explorer restart, no sign-out.
+
+### Added
+- **`SourcePath` on each registration.** Records the path the user actually
+  right-clicked, which for a folder or a shortcut is not the executable. Without
+  it the menu could only recognise the resolved `.exe`. Entries written by 1.3.0
+  and earlier are read fine; they simply match on their exe and Start Menu
+  shortcut until re-registered.
+- **`-Doctor` reports menu condition state** per shell class: how many paths are
+  in the condition, how long it is, or whether it has fallen back to showing
+  both verbs.
+- Nine self-test cases covering path canonicalisation, condition syntax, the
+  size cap, and per-class bucketing.
+
+### Notes on the limits of this mechanism
+Measured by enumerating real context menus on Windows 11 build 26200:
+- The condition stops being honoured past roughly 30,500 characters, and past
+  that point it fails *closed* — a negated condition would hide *Register* for
+  every item. WinRegister therefore caps the condition at 20,000 characters
+  (~230 registrations at typical path lengths) and, beyond that, deliberately
+  degrades to showing both verbs unconditionally. Redundant, but never a dead
+  end.
+- Matching is exact and case-insensitive, so `C:\Apps\Tool` never matches
+  `C:\Apps\Tool2`. Folder paths must carry no trailing backslash.
+- A `.lnk` does not expose its target path to the condition, so shortcuts are
+  matched on their own path.
+- Registering a folder marks that folder and its resolved exe. It does not mark
+  the *parent folder* of an exe registered directly — resolving a folder runs a
+  heuristic over its current contents, and assuming that result would go stale.
+
 ## [1.3.0] - 2026-05-12
 
 ### Added
