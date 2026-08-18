@@ -3169,9 +3169,22 @@ function Invoke-SelfTest {
     Write-Host "============================================" -ForegroundColor Cyan
     Write-Host ""
 
+    # notepad.exe was dropped from System32 in recent Windows 11 builds (it ships
+    # as a Store app now), so probe for a GUI binary that actually exists instead
+    # of hard-coding one Microsoft may remove next.
+    $guiExe = @(
+        "$env:WINDIR\System32\charmap.exe"
+        "$env:WINDIR\System32\mspaint.exe"
+        "$env:WINDIR\System32\notepad.exe"
+        "$env:WINDIR\explorer.exe"
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
     # 1. Native helpers compile + PE detection
     Test-Step 'Initialize-Native compiles' { Initialize-Native; [WinRegister.Native] -as [type] -ne $null }
-    Test-Step 'PE subsystem: notepad.exe = GUI(2)' { (Get-PESubsystem -Path "$env:WINDIR\System32\notepad.exe") -eq 2 }
+    Test-Step 'PE subsystem: a stock GUI app = GUI(2)' {
+        if (-not $guiExe) { throw 'no stock GUI executable found on this system' }
+        (Get-PESubsystem -Path $guiExe) -eq 2
+    }
     Test-Step 'PE subsystem: cmd.exe = CUI(3)'    { (Get-PESubsystem -Path "$env:WINDIR\System32\cmd.exe") -eq 3 }
     Test-Step 'PE subsystem: this script = invalid(0)' {
         $me = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
@@ -3219,7 +3232,7 @@ function Invoke-SelfTest {
     $tempDir = Join-Path $env:TEMP "WinRegister-SelfTest-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
     $tempExe = Join-Path $tempDir 'SelfTestApp.exe'
-    Copy-Item "$env:WINDIR\System32\notepad.exe" $tempExe
+    if ($guiExe) { Copy-Item -LiteralPath $guiExe -Destination $tempExe }
     $aumid = New-AppId -DisplayName 'SelfTest App' -ExePath $tempExe
 
     Test-Step 'Register: produces shortcut + ARP entry' {

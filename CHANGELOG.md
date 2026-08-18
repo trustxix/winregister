@@ -31,6 +31,12 @@ versioning follows [Semantic Versioning](https://semver.org/).
 - Nine self-test cases covering path canonicalisation, condition syntax, the
   size cap, and per-class bucketing.
 
+### Fixed
+- **`-SelfTest` was broken on current Windows 11 builds.** Two tests referenced
+  `%WINDIR%\System32\notepad.exe`, which Microsoft removed when Notepad became a
+  Store app. The suite now probes for a GUI binary that exists rather than
+  hard-coding one.
+
 ### Notes on the limits of this mechanism
 Measured by enumerating real context menus on Windows 11 build 26200:
 - The condition stops being honoured past roughly 30,500 characters, and past
