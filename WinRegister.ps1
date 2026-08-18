@@ -3293,6 +3293,65 @@ function Invoke-SelfTest {
         (@($b.lnkfile.Values) -contains 'C:\SM\Tool.lnk')
     }
 
+    # The writer itself, exercised against a scratch registry root so the user's
+    # live verbs are never touched. Verifies the exact strings written, which is
+    # what the shell actually evaluates.
+    $scratchRoot = 'HKCU:\Software\__WinRegisterSelfTest'
+    $realRoot = $script:Cfg.ContextRoot
+    function Get-ScratchCondition {
+        param([string]$Class, [string]$Verb)
+        $k = Join-Path $scratchRoot "$Class\shell\$Verb"
+        $p = Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue
+        if ($null -eq $p -or -not $p.PSObject.Properties['AppliesTo']) { return '<absent>' }
+        return $p.AppliesTo
+    }
+    function Reset-ScratchVerbs {
+        if (Test-Path -LiteralPath $scratchRoot) { Remove-Item -LiteralPath $scratchRoot -Recurse -Force }
+        foreach ($c in 'exefile', 'lnkfile', 'Directory') {
+            foreach ($v in $script:Cfg.ContextVerbId, $script:Cfg.ContextUnregVerbId) {
+                New-Item -Path (Join-Path $scratchRoot "$c\shell\$v") -Force | Out-Null
+            }
+        }
+    }
+    try {
+        $script:Cfg.ContextRoot = $scratchRoot
+
+        Test-Step 'Writer: nothing registered hides Unregister, shows Register' {
+            Reset-ScratchVerbs
+            & { function Get-RegistrationStore { [ordered]@{} }; Update-ContextMenuConditions }
+            ((Get-ScratchCondition 'exefile' $script:Cfg.ContextVerbId) -eq '<absent>') -and
+            ((Get-ScratchCondition 'exefile' $script:Cfg.ContextUnregVerbId) -eq $script:Cfg.ConditionNeverMatch)
+        }
+        Test-Step 'Writer: a registered exe flips both verbs' {
+            Reset-ScratchVerbs
+            $one = [ordered]@{ 'A' = [pscustomobject]@{ ExePath = 'C:\Apps\Tool\tool.exe' } }
+            & { function Get-RegistrationStore { $one }; Update-ContextMenuConditions }
+            ((Get-ScratchCondition 'exefile' $script:Cfg.ContextUnregVerbId) -eq
+                'System.ItemPathDisplay:="C:\Apps\Tool\tool.exe"') -and
+            ((Get-ScratchCondition 'exefile' $script:Cfg.ContextVerbId) -eq
+                'NOT (System.ItemPathDisplay:="C:\Apps\Tool\tool.exe")')
+        }
+        Test-Step 'Writer: past the cap both verbs go unconditional, not hidden' {
+            Reset-ScratchVerbs
+            $many = [ordered]@{}
+            1..400 | ForEach-Object {
+                $many["E$_"] = [pscustomobject]@{
+                    ExePath = "C:\Program Files\Vendor\Application$_\application$_.exe" } }
+            & { function Get-RegistrationStore { $many }; Update-ContextMenuConditions }
+            ((Get-ScratchCondition 'exefile' $script:Cfg.ContextVerbId) -eq '<absent>') -and
+            ((Get-ScratchCondition 'exefile' $script:Cfg.ContextUnregVerbId) -eq '<absent>')
+        }
+        Test-Step 'Writer: an unreadable store never throws' {
+            Reset-ScratchVerbs
+            & { function Get-RegistrationStore { throw 'simulated corrupt store' }
+                Update-ContextMenuConditions }
+            $true
+        }
+    } finally {
+        $script:Cfg.ContextRoot = $realRoot
+        Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # Cleanup
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     if ($sfBackup -and (Test-Path $sfBackup)) {

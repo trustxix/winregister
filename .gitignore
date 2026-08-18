@@ -1,0 +1,7 @@
+# Local safety snapshots taken before destructive operations. These can contain
+# registry exports describing the machine's installed software - never publish.
+backups/
+
+# Inno Setup output
+installer/Output/
+*.exe
