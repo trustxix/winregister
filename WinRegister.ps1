@@ -160,7 +160,7 @@ $ErrorActionPreference = 'Stop'
 #region Configuration ----------------------------------------------------------
 
 $script:Cfg = [pscustomobject]@{
-    Version              = '1.5.0'
+    Version              = '1.6.0'
     SchemaVersion        = 2
     SettingsSchemaVersion= 2
     AppName              = 'WinRegister'
@@ -190,6 +190,26 @@ $script:Cfg = [pscustomobject]@{
     LogFile              = Join-Path $env:LOCALAPPDATA 'WinRegister\winregister.log'
     LogMaxBytes          = 1MB
     SelfArpId            = 'WinRegister.Self'
+    SelfArpDisplayName   = 'WinRegister'
+    # WinRegister's own icon, shared by the Apps & Features entry and the Start
+    # Menu shortcuts. Both consumers are other processes, so a bare
+    # "imageres.dll" would be resolved against *their* DLL search path, not
+    # ours: ExtractIconEx documents lpszFile as the name of a file to extract
+    # from, and a negative index as a resource identifier rather than an offset.
+    #   https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-extracticonexw
+    # Resource 5323 verified extractable from imageres.dll on build 26200.
+    SelfIconPath         = Join-Path $env:WINDIR 'System32\imageres.dll'
+    SelfIconIndex        = -5323
+    # Marks that the install exists. Written by Install, removed by Uninstall.
+    # Without it the footprint healer cannot tell "the user uninstalled us" from
+    # "something deleted our keys", and would cheerfully resurrect the context
+    # menu after an uninstall.
+    InstallMarker        = Join-Path $env:LOCALAPPDATA 'WinRegister\.installed'
+    # Who owns the Apps & Features entry for WinRegister itself: 'owned' (we
+    # wrote it) or 'external' (an installer did, via -SkipSelfArp). The healer
+    # only maintains an entry it owns, so an Inno-installed copy never ends up
+    # with two.
+    SelfArpMarker        = Join-Path $env:LOCALAPPDATA 'WinRegister\.self-arp-owner'
     AppPathsRoot         = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths'
     UninstallRoot        = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
     ContextRoot          = 'HKCU:\Software\Classes'
@@ -256,6 +276,11 @@ $script:Cfg = [pscustomobject]@{
         (Join-Path $env:WINDIR 'WinSxS')
     )
 }
+
+# Derived after the literal so the icon location can never drift from the two
+# fields it is built out of.
+$script:Cfg | Add-Member -NotePropertyName 'SelfArpIcon' `
+    -NotePropertyValue ('{0},{1}' -f $script:Cfg.SelfIconPath, $script:Cfg.SelfIconIndex)
 
 #endregion
 
@@ -2256,6 +2281,9 @@ function Invoke-AutoHeal {
         $maint = Get-SafeProperty $prefs 'Maintenance'
         if (-not [bool](Get-SafeProperty $maint 'AutoHeal' -Default $true)) { return }
         Repair-LauncherWiring
+        # After the launcher, because the verb commands and the self shortcuts
+        # both bake in its path.
+        [void](Repair-InstallFootprint -Quiet)
         Confirm-SelfHealTask -Maintenance $maint
         [void](Invoke-SelfHeal -Quiet)
     } catch {
@@ -2845,11 +2873,11 @@ function Show-SettingsDialog {
     })
 
     $btnRepair = New-Object System.Windows.Forms.Button
-    $btnRepair.Text = 'Repair (clean dead entries)'
+    $btnRepair.Text = 'Repair install + registrations'
     $btnRepair.Size = New-Object System.Drawing.Size(190, 28)
     $btnRepair.Location = New-Object System.Drawing.Point(186, 404)
     $tabRegs.Controls.Add($btnRepair)
-    $tt.SetToolTip($btnRepair, "Removes entries whose target exe no longer exists, and recreates missing Start Menu shortcuts for live entries.")
+    $tt.SetToolTip($btnRepair, "Restores anything missing from WinRegister's own install (right-click entries, Apps & Features record, Start Menu items, the Windows 10 style context menu), then follows programs that moved, rebuilds their shortcuts, and drops entries whose program is genuinely gone.")
     $btnRepair.Add_Click({ Invoke-Repair; Refresh-RegList })
 
     $btnRefresh = New-Object System.Windows.Forms.Button
@@ -3279,17 +3307,30 @@ function Invoke-Repair {
 
     Repair-LauncherWiring
 
+    Write-Host ""
+    Write-Host "Install:" -ForegroundColor White
+    # -Repair is the explicit, foreground pass, so it is the one place that also
+    # restores the classic-menu shell preference. Doing that silently from the
+    # scheduled task would override a setting the user may have changed on
+    # purpose, and it needs an Explorer restart to show up either way.
+    $footprint = @(Repair-InstallFootprint -IncludeShellPreference)
+    if ($footprint.Count -eq 0) {
+        Write-Host "  Nothing to restore - the install is complete." -ForegroundColor DarkGray
+    }
+
     $store = Get-RegistrationStore
     if ($store.Count -eq 0) {
         # Still resync the menu: an emptied or deleted registrations.json is
         # precisely the case where a stale condition would leave "Unregister"
         # showing for programs that are no longer tracked.
         Update-ContextMenuConditions
-        Write-Host "Nothing to repair - no registrations." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "No registrations to check." -ForegroundColor Yellow
         return
     }
 
     Write-Host ""
+    Write-Host "Registrations:" -ForegroundColor White
     $s = Invoke-SelfHeal
     Write-Host ""
     Write-Host ("Repair complete: {0} healthy, {1} repaired, {2} relocated, {3} removed." -f
@@ -3327,8 +3368,48 @@ function Invoke-Doctor {
                     else { 'MISSING - falling back to powershell.exe' }
     Write-Host "  Hidden launcher:     $launcherKind" -ForegroundColor $(if ($launcher) {'Green'} else {'Yellow'})
     Write-Host "  Registry file:       $(if ($registry) {'OK'} else {'(empty - no registrations yet)'})" -ForegroundColor $(if ($registry) {'Green'} else {'Yellow'})
-    $classicSrc = if ($classic) { if ($ownClassic) { 'enabled by WinRegister' } else { 'enabled (set externally)' } } else { 'disabled - entries hide under Show more options' }
+    # A registry verb cannot be promoted to the Win11 top-level menu at all -
+    # that requires IExplorerCommand plus package identity (MSIX or a sparse
+    # package). Neutralising the modern provider's CLSID per user is the only
+    # mechanism available to a script, so say what it is and how to get it.
+    #   https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/integrate-packaged-app-with-file-explorer
+    $classicSrc = if ($classic) {
+        if ($ownClassic) { 'enabled by WinRegister' } else { 'enabled (set externally)' }
+    } else {
+        'disabled - entries sit under Show more options; run -Repair to enable'
+    }
     Write-Host "  Classic menu (Win11):$classicSrc" -ForegroundColor $(if ($classic) {'Green'} else {'Yellow'})
+
+    Write-Host ""
+    Write-Host "  WinRegister's own install:" -ForegroundColor White
+    $present = Test-InstallPresent
+    if (-not $present) {
+        Write-Host "    [--] not installed - run Install.cmd" -ForegroundColor Yellow
+    } else {
+        $arpOwner = Get-SelfArpOwner
+        $arpLine = switch ($arpOwner) {
+            'external' { '[OK] Apps & Features -> provided by the installer' }
+            default {
+                if (Test-SelfArpCurrent) { '[OK] Apps & Features -> present and current' }
+                elseif (Test-Path -LiteralPath (Join-Path $script:Cfg.UninstallRoot $script:Cfg.SelfArpId)) {
+                    '[!!] Apps & Features -> stale (run -Repair)'
+                } else { '[!!] Apps & Features -> missing (run -Repair)' }
+            }
+        }
+        Write-Host "    $arpLine" -ForegroundColor $(if ($arpLine -like '`[OK`]*') {'Green'} else {'Yellow'})
+
+        $smMissing = @('WinRegister Settings', 'WinRegister Updates') | Where-Object {
+            -not (Test-Path -LiteralPath (Join-Path $script:Cfg.SelfStartMenuFolder "$_.lnk")) }
+        Write-Host ("    {0} Start Menu entries -> {1}" -f
+            $(if ($smMissing.Count -eq 0) {'[OK]'} else {'[!!]'}),
+            $(if ($smMissing.Count -eq 0) {'present'} else {"$($smMissing.Count) missing (run -Repair)"})) `
+            -ForegroundColor $(if ($smMissing.Count -eq 0) {'Green'} else {'Yellow'})
+
+        $onPath = @(([Environment]::GetEnvironmentVariable('Path', 'User') -split ';')) -contains $script:Cfg.DataFolder
+        Write-Host ("    {0} user PATH -> {1}" -f
+            $(if ($onPath) {'[OK]'} else {'[!!]'}), $(if ($onPath) {'present'} else {'missing (run -Repair)'})) `
+            -ForegroundColor $(if ($onPath) {'Green'} else {'Yellow'})
+    }
 
     Write-Host ""
     Write-Host "  Context menu entries:" -ForegroundColor White
@@ -3604,6 +3685,270 @@ function Repair-LauncherWiring {
     }
 }
 
+#endregion
+
+#region Install footprint self-heal -------------------------------------------
+# The 1.5.0 healer follows the programs WinRegister registered. It does not
+# follow WinRegister's own install, and everything in that install existed only
+# as a side effect of running -Install once. That is a real gap rather than a
+# theoretical one, because -Install restarts Explorer: upgrades are deployed by
+# copying the script over and running the healer, so any artefact introduced
+# after a machine's last -Install was never created on that machine at all.
+# Measured here: -Install last ran on 2026-05-12 against the initial build, so
+# the Apps & Features entry added in 1.2.0 had never once been written.
+
+function Set-InstallMarker {
+    try {
+        Initialize-DataFolder
+        Set-Content -LiteralPath $script:Cfg.InstallMarker -Value $script:Cfg.Version -Encoding ASCII
+    } catch {
+        Write-Log "Could not write the install marker: $_" -Level Warn
+    }
+}
+
+function Test-InstallPresent {
+    # Is WinRegister installed right now? Everything below rebuilds missing
+    # pieces of the install, so this is the guard that stops an uninstall from
+    # being undone by the next -List or by the scheduled task: with the verbs
+    # gone and the marker gone, there is nothing to repair.
+    #
+    # An install predating the marker is adopted on sight of any verb key it
+    # wrote, so upgrading does not require a reinstall to become repairable.
+    if (Test-Path -LiteralPath $script:Cfg.InstallMarker) { return $true }
+
+    foreach ($class in 'exefile', 'lnkfile', 'Directory') {
+        foreach ($verb in $script:Cfg.ContextVerbId, $script:Cfg.ContextUnregVerbId) {
+            if (Test-Path -LiteralPath (Join-Path $script:Cfg.ContextRoot "$class\shell\$verb")) {
+                Set-InstallMarker
+                Write-Log "Adopted an existing install that predates the install marker."
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Set-SelfArpOwner {
+    param([Parameter(Mandatory)] [ValidateSet('owned', 'external')] [string]$Owner)
+    try {
+        Initialize-DataFolder
+        Set-Content -LiteralPath $script:Cfg.SelfArpMarker -Value $Owner -Encoding ASCII
+    } catch {
+        Write-Log "Could not record the Apps & Features owner: $_" -Level Warn
+    }
+}
+
+function Get-SelfArpOwner {
+    # 'owned' - we wrote the entry and maintain it.
+    # 'external' - an installer wrote it; stay out of the way entirely.
+    # 'unclaimed' - no record yet, so decide once and write the answer down.
+    if (Test-Path -LiteralPath $script:Cfg.SelfArpMarker) {
+        try {
+            $v = (Get-Content -LiteralPath $script:Cfg.SelfArpMarker -Raw -ErrorAction Stop).Trim().ToLowerInvariant()
+            if ($v -eq 'owned' -or $v -eq 'external') { return $v }
+        } catch { }
+    }
+    return 'unclaimed'
+}
+
+function Find-ForeignSelfArpEntry {
+    # An Apps & Features record for WinRegister that we did not write - what the
+    # Inno Setup installer leaves behind when it runs -Install -SkipSelfArp.
+    # Claiming the entry while one of those exists would show the user two
+    # identical "WinRegister" rows, so look before claiming. Read-only, and
+    # bounded to the three Uninstall hives Windows itself enumerates.
+    foreach ($root in @(
+        $script:Cfg.UninstallRoot
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        try {
+            foreach ($k in Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue) {
+                if ($k.PSChildName -eq $script:Cfg.SelfArpId) { continue }
+                $p = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
+                # Entries we wrote for the user's own programs are ours, not a
+                # competing installer's - a program legitimately named
+                # "WinRegister" would otherwise veto our entry forever.
+                if ((Get-SafeProperty $p 'WinRegisterManaged')) { continue }
+                if ((Get-SafeProperty $p 'DisplayName') -ieq $script:Cfg.SelfArpDisplayName) { return $k.Name }
+            }
+        } catch { }
+    }
+    return $null
+}
+
+function Test-SelfArpCurrent {
+    # Present, and describing this build from this location. Version drift counts
+    # as stale so an upgrade deployed by file copy still reports its real version
+    # in Settings instead of whichever one last ran -Install.
+    $keyPath = Join-Path $script:Cfg.UninstallRoot $script:Cfg.SelfArpId
+    if (-not (Test-Path -LiteralPath $keyPath)) { return $false }
+    $p = Get-ItemProperty -LiteralPath $keyPath -ErrorAction SilentlyContinue
+    if (-not $p) { return $false }
+    if ((Get-SafeProperty $p 'DisplayVersion') -ne $script:Cfg.Version)     { return $false }
+    if ((Get-SafeProperty $p 'DisplayIcon')    -ne $script:Cfg.SelfArpIcon) { return $false }
+    return ([string](Get-SafeProperty $p 'UninstallString')).Contains($script:Cfg.InstalledScript)
+}
+
+function Set-ContextMenuVerbs {
+    # Writes the six verb keys. Shared by Install and by the footprint healer so
+    # the two can never come to describe the menu differently.
+    #
+    # No New-Item -Force on a key that already exists: in the registry provider
+    # that deletes the key's values, and AppliesTo lives on the verb key. Blanking
+    # it does not mean "no filter" in any harmless sense - it means both verbs
+    # appear on every item at once, which is the state 1.4.0 existed to end.
+    param([switch]$OnlyMissing)
+
+    $launcherCmd = Get-LauncherCommand
+    $written = @()
+
+    foreach ($class in 'exefile', 'lnkfile', 'Directory') {
+        foreach ($pair in @(
+            @{ Verb = $script:Cfg.ContextVerbId
+               Label = $script:Cfg.ContextLabel
+               Icon = $script:Cfg.ContextIconRegister
+               Action = '-Register' }
+            @{ Verb = $script:Cfg.ContextUnregVerbId
+               Label = $script:Cfg.ContextUnregLabel
+               Icon = $script:Cfg.ContextIconUnregister
+               Action = '-Unregister' }
+        )) {
+            $verbKey = Join-Path $script:Cfg.ContextRoot "$class\shell\$($pair.Verb)"
+            $cmdKey  = Join-Path $verbKey 'command'
+            $verbExists = Test-Path -LiteralPath $verbKey
+            $cmdExists  = Test-Path -LiteralPath $cmdKey
+
+            if ($OnlyMissing -and $verbExists -and $cmdExists) { continue }
+
+            if (-not $verbExists) { New-Item -Path $verbKey -Force | Out-Null }
+            if (-not $cmdExists)  { New-Item -Path $cmdKey  -Force | Out-Null }
+
+            Set-ItemProperty -LiteralPath $verbKey -Name '(Default)' -Value $pair.Label -Type String
+            Set-ItemProperty -LiteralPath $verbKey -Name 'Icon'      -Value $pair.Icon  -Type String
+            Set-ItemProperty -LiteralPath $cmdKey  -Name '(Default)' `
+                -Value ('{0} {1} "%1"' -f $launcherCmd, $pair.Action) -Type String
+            $written += "$class\$($pair.Verb)"
+        }
+    }
+    return $written
+}
+
+function Repair-InstallFootprint {
+    # Everything -Install writes that is not a registration, restored in place
+    # and without touching Explorer.
+    #
+    # $IncludeShellPreference gates the one item here that is not WinRegister's
+    # own property. The classic-context-menu tweak is a machine-wide shell
+    # setting that the user may have deliberately changed, and it only takes
+    # effect when Explorer next starts, so a silent background pass never
+    # touches it - only an explicit -Repair does.
+    param([switch]$Quiet, [switch]$IncludeShellPreference)
+
+    $fixed = @()
+    if (-not (Test-InstallPresent)) { return $fixed }
+
+    # 1. Context menu verbs. One can go missing on its own - a cleanup tool, a
+    #    profile roam, an uninstall that died halfway - and the loss is silent:
+    #    that class of item simply stops offering the menu.
+    try {
+        $verbs = @(Set-ContextMenuVerbs -OnlyMissing)
+        if ($verbs.Count -gt 0) {
+            Update-ContextMenuConditions
+            $fixed += "context menu ({0})" -f ($verbs -join ', ')
+        }
+    } catch {
+        Write-Log "Context menu repair failed (non-fatal): $_" -Level Warn
+    }
+
+    # 2. WinRegister's own Apps & Features entry.
+    try {
+        switch (Get-SelfArpOwner) {
+            'external' { }
+            'owned' {
+                if (-not (Test-SelfArpCurrent)) { Register-SelfInArp; $fixed += 'apps & features' }
+            }
+            default {
+                # The decision is recorded before the write is attempted. If the
+                # write throws, the marker still says 'owned', so the next pass
+                # takes the one-key Test-SelfArpCurrent path instead of
+                # re-enumerating three Uninstall hives on every right-click.
+                $foreign = Find-ForeignSelfArpEntry
+                if ($foreign) {
+                    Set-SelfArpOwner -Owner 'external'
+                    Write-Log "Apps & Features entry already provided by ${foreign}; leaving it alone."
+                } else {
+                    Set-SelfArpOwner -Owner 'owned'
+                    if (-not (Test-SelfArpCurrent)) {
+                        Register-SelfInArp
+                        $fixed += 'apps & features'
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Log "Apps & Features repair failed (non-fatal): $_" -Level Warn
+    }
+
+    # 3. Start Menu entries for the Settings UI and the update check.
+    try {
+        $missing = @('WinRegister Settings', 'WinRegister Updates') | Where-Object {
+            -not (Test-Path -LiteralPath (Join-Path $script:Cfg.SelfStartMenuFolder "$_.lnk"))
+        }
+        if ($missing.Count -gt 0 -and (Test-Path -LiteralPath $script:Cfg.HiddenLauncher)) {
+            New-SelfStartMenuShortcuts
+            $fixed += 'start menu'
+        }
+    } catch {
+        Write-Log "Self Start Menu repair failed (non-fatal): $_" -Level Warn
+    }
+
+    # 4. User PATH, so the winregister.cmd shim keeps resolving in a terminal.
+    try {
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if (-not $userPath) { $userPath = '' }
+        $segments = @($userPath -split ';' | Where-Object { $_ })
+        if ($segments -notcontains $script:Cfg.DataFolder) {
+            [Environment]::SetEnvironmentVariable('Path', ((@($segments) + $script:Cfg.DataFolder) -join ';'), 'User')
+            $fixed += 'user PATH'
+        }
+    } catch {
+        Write-Log "PATH repair failed (non-fatal): $_" -Level Warn
+    }
+
+    # 5. Classic context menu. Explicit requests only - see the header.
+    if ($IncludeShellPreference -and -not (Test-ClassicMenuEnabled)) {
+        try {
+            if (Enable-ClassicContextMenu) {
+                Set-Content -LiteralPath $script:Cfg.ClassicMenuMarker -Value 'true' -Encoding ASCII
+                $fixed += 'classic context menu'
+                if (-not $Quiet) {
+                    Write-Host "  RESTORE classic context menu - sign out or restart Explorer to see it" `
+                        -ForegroundColor Cyan
+                }
+            }
+        } catch {
+            Write-Log "Classic menu enable failed (non-fatal): $_" -Level Warn
+        }
+    }
+
+    if ($fixed.Count -gt 0) {
+        Write-Log "Install footprint repaired: $($fixed -join ', ')"
+        if (-not $Quiet) {
+            foreach ($f in $fixed) {
+                if ($f -eq 'classic context menu') { continue }   # already printed with its caveat
+                Write-Host ("  RESTORE {0}" -f $f) -ForegroundColor Cyan
+            }
+        }
+    }
+    return $fixed
+}
+
+#endregion
+
+#region Install / Uninstall (scheduling, self-registration) -------------------
+
 function Register-SelfHealTask {
     # Per-user scheduled task - no elevation, no admin rights. Runs the healer at
     # logon and once a day so a program that moves while WinRegister is not being
@@ -3698,15 +4043,19 @@ function Register-SelfInArp {
     $quietCmd = $uninstallCmd
 
     $installDate = (Get-Date).ToString('yyyyMMdd')
+    # Same int64 trap that cost large programs their ARP entry: the sum is a
+    # nullable double, and an unclamped [int] cast throws once it exceeds
+    # Int32.MaxValue. Clamp on the int64 side of the divide.
     $estimatedKb = 0
     try {
         $size = (Get-ChildItem -LiteralPath $script:Cfg.DataFolder -Recurse -File -ErrorAction SilentlyContinue |
             Measure-Object -Sum Length).Sum
-        $estimatedKb = [int]($size / 1KB)
+        if ($null -eq $size) { $size = 0 }
+        $estimatedKb = [int][Math]::Min([int64][int]::MaxValue, [int64]([int64]$size / 1KB))
     } catch { }
 
-    Set-ItemProperty -LiteralPath $keyPath -Name 'DisplayName'          -Value 'WinRegister'                    -Type String
-    Set-ItemProperty -LiteralPath $keyPath -Name 'DisplayIcon'          -Value 'imageres.dll,-5323'             -Type String
+    Set-ItemProperty -LiteralPath $keyPath -Name 'DisplayName'          -Value $script:Cfg.SelfArpDisplayName   -Type String
+    Set-ItemProperty -LiteralPath $keyPath -Name 'DisplayIcon'          -Value $script:Cfg.SelfArpIcon          -Type String
     Set-ItemProperty -LiteralPath $keyPath -Name 'DisplayVersion'       -Value $script:Cfg.Version              -Type String
     Set-ItemProperty -LiteralPath $keyPath -Name 'Publisher'            -Value $script:Cfg.Publisher            -Type String
     Set-ItemProperty -LiteralPath $keyPath -Name 'InstallLocation'      -Value $script:Cfg.DataFolder           -Type String
@@ -3718,6 +4067,7 @@ function Register-SelfInArp {
     Set-ItemProperty -LiteralPath $keyPath -Name 'NoModify'             -Value 1                                -Type DWord
     Set-ItemProperty -LiteralPath $keyPath -Name 'NoRepair'             -Value 1                                -Type DWord
 
+    Set-SelfArpOwner -Owner 'owned'
     Write-Log "Self-registered in Apps & Features at $keyPath"
 }
 
@@ -3747,14 +4097,18 @@ function New-SelfStartMenuShortcuts {
         @{ Name = 'WinRegister Updates';  Arg = '-CheckUpdate'; Aumid = 'WinRegister.Self.Updates' }
     )) {
         $scPath = Join-Path $script:Cfg.SelfStartMenuFolder "$($entry.Name).lnk"
+        # The icon comes from imageres rather than from the launcher: the
+        # launcher is a bare csc output with no icon resource at all, and a
+        # shortcut pointing at an icon-less binary renders as the generic
+        # blank-page icon in the Start Menu.
         [WinRegister.Native]::CreateShortcut(
             $scPath,
             $launcher,
             $entry.Arg,
             $script:Cfg.DataFolder,
             $entry.Name,
-            $script:Cfg.InstalledScript,    # icon source - PS doesn't have a great icon, fall back to imageres if PE has none
-            0,
+            $script:Cfg.SelfIconPath,
+            $script:Cfg.SelfIconIndex,
             $entry.Aumid
         )
         Write-Log "Created self Start Menu shortcut: $scPath"
@@ -3805,35 +4159,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$($script:Cfg.Installed
         Write-Log "Added $($script:Cfg.DataFolder) to user PATH."
     }
 
-    $launcherCmd = Get-LauncherCommand
-
-    $targets = @(
-        @{ Class = 'exefile'   }
-        @{ Class = 'lnkfile'   }
-        @{ Class = 'Directory' }
-    )
-
-    foreach ($t in $targets) {
-        $base = Join-Path $script:Cfg.ContextRoot "$($t.Class)\shell"
-
-        $reg = Join-Path $base $script:Cfg.ContextVerbId
-        $regCmd = Join-Path $reg 'command'
-        New-Item -Path $reg -Force | Out-Null
-        New-Item -Path $regCmd -Force | Out-Null
-        Set-ItemProperty -LiteralPath $reg -Name '(Default)' -Value $script:Cfg.ContextLabel
-        Set-ItemProperty -LiteralPath $reg -Name 'Icon'      -Value $script:Cfg.ContextIconRegister
-        Set-ItemProperty -LiteralPath $regCmd -Name '(Default)' -Value "$launcherCmd -Register `"%1`""
-
-        $unreg = Join-Path $base $script:Cfg.ContextUnregVerbId
-        $unregCmd = Join-Path $unreg 'command'
-        New-Item -Path $unreg -Force | Out-Null
-        New-Item -Path $unregCmd -Force | Out-Null
-        Set-ItemProperty -LiteralPath $unreg -Name '(Default)' -Value $script:Cfg.ContextUnregLabel
-        Set-ItemProperty -LiteralPath $unreg -Name 'Icon'      -Value $script:Cfg.ContextIconUnregister
-        Set-ItemProperty -LiteralPath $unregCmd -Name '(Default)' -Value "$launcherCmd -Unregister `"%1`""
-
-        Write-Log "Wrote context menu for $($t.Class): $base"
-    }
+    $verbs = @(Set-ContextMenuVerbs)
+    Write-Log "Wrote context menu verbs: $($verbs -join ', ')"
 
     # Seed the visibility conditions from whatever is already registered, so an
     # upgrade over an existing install gets a correct menu immediately rather
@@ -3862,6 +4189,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$($script:Cfg.Installed
     if (-not $SkipSelfArp) {
         try { Register-SelfInArp } catch { Write-Log "Self-ARP failed (non-fatal): $_" -Level Warn }
     } else {
+        # Recorded, not just logged: the footprint healer reads this to know it
+        # must never write a competing entry alongside the installer's own.
+        Set-SelfArpOwner -Owner 'external'
         Write-Log "Self-ARP skipped (-SkipSelfArp specified)."
     }
 
@@ -3874,6 +4204,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$($script:Cfg.Installed
     if ([bool](Get-SafeProperty (Get-SafeProperty $prefs 'Maintenance') 'ScheduledTask' -Default $true)) {
         try { [void](Register-SelfHealTask) } catch { Write-Log "Self-heal task registration failed (non-fatal): $_" -Level Warn }
     }
+
+    # Last, so the footprint healer only ever sees a complete install.
+    Set-InstallMarker
 
     # Restart Explorer so the classic menu + new entries take effect immediately.
     Restart-WindowsExplorer
@@ -3895,6 +4228,23 @@ function Uninstall-WinRegister {
     }
 
     if ($Purge) {
+        # -Purge is one click away in Apps & Features, and it ends by deleting
+        # the data folder - which is where Backup-File would have put its
+        # snapshot. Write this one outside the folder so it survives, and record
+        # where it went; the Settings "Clear all" path has always backed up, and
+        # the more destructive path should not be the one that does not.
+        try {
+            if (Test-Path -LiteralPath $script:Cfg.RegistryFile) {
+                $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+                $rescue = Join-Path (Split-Path $script:Cfg.DataFolder -Parent) "WinRegister-registrations-$stamp.json"
+                Copy-Item -LiteralPath $script:Cfg.RegistryFile -Destination $rescue -Force
+                Write-Log "Saved a pre-purge copy of the registrations to $rescue"
+                $script:PurgeBackupPath = $rescue
+            }
+        } catch {
+            Write-Log "Pre-purge backup failed (continuing): $_" -Level Warn
+        }
+
         $store = Get-RegistrationStore
         foreach ($key in @($store.Keys)) {
             $entry = $store[$key]
@@ -3926,7 +4276,12 @@ function Uninstall-WinRegister {
     try { Remove-SelfStartMenuShortcuts }  catch { Write-Log "Remove self Start Menu: $_" -Level Warn }
     try { Unregister-SelfHealTask }        catch { Write-Log "Remove self-heal task: $_" -Level Warn }
 
-    foreach ($stale in $script:Cfg.HiddenLauncher, $script:Cfg.LauncherStamp, $script:Cfg.LegacyVbsLauncher) {
+    # The install marker goes with them: while it survives, the footprint healer
+    # would treat the next -List or scheduled run as a broken install and put
+    # the context menu straight back.
+    foreach ($stale in $script:Cfg.HiddenLauncher, $script:Cfg.LauncherStamp,
+                       $script:Cfg.LegacyVbsLauncher, $script:Cfg.InstallMarker,
+                       $script:Cfg.SelfArpMarker) {
         Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
     }
 
@@ -3951,7 +4306,12 @@ function Uninstall-WinRegister {
     }
     Restart-WindowsExplorer
 
-    Show-ToastMessage -Title 'WinRegister uninstalled' -Message 'Context menu entries removed.' -Level Info
+    $msg = if ($script:PurgeBackupPath) {
+        "Context menu entries removed. Registrations backed up to $(Split-Path $script:PurgeBackupPath -Leaf)."
+    } else {
+        'Context menu entries removed.'
+    }
+    Show-ToastMessage -Title 'WinRegister uninstalled' -Message $msg -Level Info
 }
 
 #endregion
@@ -4191,6 +4551,135 @@ function Invoke-SelfTest {
         Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # 6b. Install-footprint healing. Everything here runs against scratch registry
+    #     roots and scratch marker paths; the live install is never touched.
+    #
+    #     The full Repair-InstallFootprint pass is only driven in its no-op case.
+    #     With the install present it writes the user's PATH, and a verification
+    #     run has no business editing that - so the pieces are asserted
+    #     individually instead, which is also where the contracts actually live.
+    $fpRoot = 'HKCU:\Software\__WinRegisterFootprintTest'
+    $fpDir  = Join-Path $env:TEMP "WinRegister-FP-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+    $saved = @{
+        ContextRoot   = $script:Cfg.ContextRoot
+        UninstallRoot = $script:Cfg.UninstallRoot
+        InstallMarker = $script:Cfg.InstallMarker
+        SelfArpMarker = $script:Cfg.SelfArpMarker
+    }
+    try {
+        New-Item -ItemType Directory -Path $fpDir -Force | Out-Null
+        $script:Cfg.ContextRoot   = "$fpRoot\Classes"
+        $script:Cfg.UninstallRoot = "$fpRoot\Uninstall"
+        $script:Cfg.InstallMarker = Join-Path $fpDir '.installed'
+        $script:Cfg.SelfArpMarker = Join-Path $fpDir '.self-arp-owner'
+
+        Test-Step 'Install state: no verbs and no marker means not installed' {
+            Remove-Item -LiteralPath $fpRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $script:Cfg.InstallMarker -Force -ErrorAction SilentlyContinue
+            -not (Test-InstallPresent)
+        }
+        Test-Step 'Uninstall stays uninstalled: the healer rebuilds nothing' {
+            # The regression this guards: a footprint healer that recreates verb
+            # keys unconditionally would put the context menu back on the next
+            # -List or scheduled run, so an uninstall would never stick.
+            @(Repair-InstallFootprint -Quiet).Count -eq 0
+        }
+        Test-Step 'Install state: an existing verb is adopted as an install' {
+            New-Item -Path (Join-Path $script:Cfg.ContextRoot "exefile\shell\$($script:Cfg.ContextVerbId)") -Force | Out-Null
+            (Test-InstallPresent) -and (Test-Path -LiteralPath $script:Cfg.InstallMarker)
+        }
+
+        Test-Step 'Verbs: a missing verb is rebuilt with label, icon and command' {
+            Remove-Item -LiteralPath $fpRoot -Recurse -Force -ErrorAction SilentlyContinue
+            [void](Set-ContextMenuVerbs)
+            $k = Join-Path $script:Cfg.ContextRoot "Directory\shell\$($script:Cfg.ContextUnregVerbId)"
+            $p = Get-ItemProperty -LiteralPath $k
+            $c = (Get-ItemProperty -LiteralPath "$k\command").'(default)'
+            ($p.'(default)' -eq $script:Cfg.ContextUnregLabel) -and
+            ($p.Icon -eq $script:Cfg.ContextIconUnregister) -and
+            ($c -eq ('{0} -Unregister "%1"' -f (Get-LauncherCommand)))
+        }
+        Test-Step 'Verbs: -OnlyMissing never blanks a live AppliesTo condition' {
+            # New-Item -Force on an existing registry key deletes its values, and
+            # AppliesTo lives on the verb key. Losing it does not fail open in a
+            # harmless way - it shows both verbs on every item at once.
+            $k = Join-Path $script:Cfg.ContextRoot "exefile\shell\$($script:Cfg.ContextVerbId)"
+            Set-ItemProperty -LiteralPath $k -Name 'AppliesTo' -Value 'NOT (System.ItemPathDisplay:="C:\keep.exe")'
+            [void](Set-ContextMenuVerbs -OnlyMissing)
+            (Get-ItemProperty -LiteralPath $k).AppliesTo -eq 'NOT (System.ItemPathDisplay:="C:\keep.exe")'
+        }
+        Test-Step 'Verbs: -OnlyMissing restores just the one that vanished' {
+            $gone = Join-Path $script:Cfg.ContextRoot "lnkfile\shell\$($script:Cfg.ContextVerbId)"
+            Remove-Item -LiteralPath $gone -Recurse -Force
+            $rebuilt = @(Set-ContextMenuVerbs -OnlyMissing)
+            ($rebuilt.Count -eq 1) -and (Test-Path -LiteralPath "$gone\command")
+        }
+
+        Test-Step 'Self-ARP: ownership defaults to unclaimed and round-trips' {
+            Remove-Item -LiteralPath $script:Cfg.SelfArpMarker -Force -ErrorAction SilentlyContinue
+            if ((Get-SelfArpOwner) -ne 'unclaimed') { return $false }
+            Set-SelfArpOwner -Owner 'external'
+            (Get-SelfArpOwner) -eq 'external'
+        }
+        Test-Step 'Self-ARP: writing the entry claims ownership' {
+            Register-SelfInArp
+            ((Get-SelfArpOwner) -eq 'owned') -and (Test-SelfArpCurrent)
+        }
+        Test-Step 'Self-ARP: DisplayIcon is an absolute path, not a bare DLL name' {
+            # A bare "imageres.dll" is resolved against the DLL search path of
+            # whatever process renders Apps & Features, which is not ours.
+            $p = Get-ItemProperty -LiteralPath (Join-Path $script:Cfg.UninstallRoot $script:Cfg.SelfArpId)
+            [System.IO.Path]::IsPathRooted(($p.DisplayIcon -split ',')[0]) -and
+            ($p.EstimatedSize -ge 0)
+        }
+        Test-Step 'Self-ARP: a version bump makes the entry stale' {
+            Set-ItemProperty -LiteralPath (Join-Path $script:Cfg.UninstallRoot $script:Cfg.SelfArpId) `
+                -Name 'DisplayVersion' -Value '0.0.1-old'
+            -not (Test-SelfArpCurrent)
+        }
+        Test-Step 'Self-ARP: our own app entries never look like a rival installer' {
+            # Registering a program that happens to be called WinRegister must not
+            # veto our own entry for good.
+            $mimic = Join-Path $script:Cfg.UninstallRoot 'WinRegister.Mimic.0000000000'
+            New-Item -Path $mimic -Force | Out-Null
+            Set-ItemProperty -LiteralPath $mimic -Name 'DisplayName' -Value 'WinRegister' -Type String
+            Set-ItemProperty -LiteralPath $mimic -Name 'WinRegisterManaged' -Value 1 -Type DWord
+            (Find-ForeignSelfArpEntry) -notlike '*WinRegister.Mimic*'
+        }
+        Test-Step 'Start Menu: self shortcuts take their icon from imageres' {
+            # The launcher is a bare csc output with no icon resource, so a
+            # shortcut that pointed its icon at the launcher would render as the
+            # generic blank page.
+            if (-not (Test-Path -LiteralPath $script:Cfg.HiddenLauncher)) { return $true }
+            $realSm = $script:Cfg.SelfStartMenuFolder
+            try {
+                $script:Cfg.SelfStartMenuFolder = Join-Path $fpDir 'StartMenu'
+                New-SelfStartMenuShortcuts
+                $lnk = Join-Path $script:Cfg.SelfStartMenuFolder 'WinRegister Settings.lnk'
+                if (-not (Test-Path -LiteralPath $lnk)) { return $false }
+                $sh = New-Object -ComObject WScript.Shell
+                try { $icon = $sh.CreateShortcut($lnk).IconLocation }
+                finally { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sh) }
+                ($icon -like '*imageres.dll*') -and ($icon -notlike '*launcher*')
+            } finally {
+                $script:Cfg.SelfStartMenuFolder = $realSm
+            }
+        }
+        Test-Step 'Self-ARP: a real rival entry is detected and deferred to' {
+            $rival = Join-Path $script:Cfg.UninstallRoot 'SomeInstallerProduct'
+            New-Item -Path $rival -Force | Out-Null
+            Set-ItemProperty -LiteralPath $rival -Name 'DisplayName' -Value 'WinRegister' -Type String
+            (Find-ForeignSelfArpEntry) -like '*SomeInstallerProduct*'
+        }
+    } finally {
+        $script:Cfg.ContextRoot   = $saved.ContextRoot
+        $script:Cfg.UninstallRoot = $saved.UninstallRoot
+        $script:Cfg.InstallMarker = $saved.InstallMarker
+        $script:Cfg.SelfArpMarker = $saved.SelfArpMarker
+        Remove-Item -LiteralPath $fpRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $fpDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # 7. Launcher: must not depend on a script-engine file association
     Test-Step 'Launcher: a C# compiler is available' { $null -ne (Get-CSharpCompiler) }
     Test-Step 'Launcher: builds a GUI-subsystem executable' {
@@ -4410,6 +4899,7 @@ try {
         'Repair'     { Invoke-Repair }
         'SelfHeal'   {
             Repair-LauncherWiring
+            [void](Repair-InstallFootprint -Quiet)
             Confirm-SelfHealTask -Maintenance (Get-SafeProperty (Get-Settings) 'Maintenance')
             [void](Invoke-SelfHeal -Quiet)
         }
