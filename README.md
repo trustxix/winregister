@@ -88,6 +88,25 @@ executable another registration already owns, and stops at the first ancestor to
 broad to search, so it never scans a whole drive. Every stage has an off switch
 under `Maintenance` in `settings.json`.
 
+The same pass looks after WinRegister's own install: if a right-click entry, the
+Apps & Features record, a Start Menu item or the `PATH` entry goes missing, it is
+put back in place — no reinstall, and Explorer is never restarted. An uninstall
+still sticks, because the healer only rebuilds an install that is actually there.
+
+## Windows 11 and "Show more options"
+
+On Windows 11 a registry-based right-click entry cannot appear on the top-level
+menu. That requires a shell extension implementing
+[`IExplorerCommand`](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/integrate-packaged-app-with-file-explorer)
+with package identity, which a script cannot provide. WinRegister's entries
+therefore live under **Show more options** (or `Shift`+right-click) unless the
+Windows 10 style menu is turned on.
+
+`-Install` turns it on, and `winregister -Repair` turns it on later if something
+else has since turned it off. It is a per-user setting, WinRegister records
+whether it was the one that set it, and `-Uninstall` reverts only its own change.
+Either way it takes effect the next time Explorer starts.
+
 Implementation references the Microsoft Win32 specifications directly — see
 the inline comments in `WinRegister.ps1` for citations against the
 [PE Format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format),
@@ -105,7 +124,7 @@ winregister -Unregister <path>     Remove a previous registration
 winregister -List                  Show all registered programs
 winregister -Settings              Open the Settings dialog
 winregister -CheckUpdate           Check for a newer release now
-winregister -Repair                Follow moved programs, rebuild artefacts, drop dead entries
+winregister -Repair                Restore the install, follow moved programs, drop dead entries
 winregister -SelfHeal              The same pass, silent (runs automatically)
 winregister -Doctor                Diagnostic snapshot
 winregister -Uninstall             Remove the right-click menu entries

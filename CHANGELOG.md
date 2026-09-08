@@ -4,6 +4,65 @@ All notable changes to WinRegister are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] - 2026-09-08
+
+### Fixed
+- **WinRegister never appeared in Settings → Apps, on any machine upgraded
+  rather than reinstalled.** The Apps & Features entry for WinRegister itself
+  was written by `-Install` and by nothing else. `-Install` restarts Explorer,
+  so upgrades are deployed by replacing the script and letting the healer run —
+  which meant every artefact introduced after a machine's last `-Install` was
+  never created on that machine at all. On the author's machine `-Install` last
+  ran in May against the initial build, so the self-registration added in 1.2.0
+  had never once executed. The Start Menu entries for Settings and Updates were
+  missing for the same reason.
+- **The Apps & Features icon was a bare `imageres.dll` with no path.**
+  `DisplayIcon` is read by whichever process renders the Settings page, so the
+  filename was being resolved against *that* process's DLL search path rather
+  than `System32`.
+- **The self Start Menu shortcuts took their icon from the launcher**, which is
+  a bare compiler output with no icon resource, so they rendered as a blank page.
+- **`-Uninstall -Purge` deleted `registrations.json` without a backup.** It is
+  one click away in Apps & Features, and it ends by removing the data folder —
+  which is where a backup would have been written. The snapshot now goes outside
+  that folder and its name is reported in the completion toast. The Settings
+  *Clear all* path has always backed up; the more destructive path should not
+  have been the one that did not.
+- The self-registration's `EstimatedSize` was cast to `[int]` unclamped — the
+  same overflow that cost large programs their entry in 1.5.0.
+
+### Added
+- **The install now heals itself, the way registrations already did.**
+  `Repair-InstallFootprint` restores anything missing from WinRegister's own
+  install — context-menu verb keys, the Apps & Features record, the Start Menu
+  entries, the `PATH` entry — in place, with no reinstall and without touching
+  Explorer. It runs silently before every action and from the scheduled task,
+  and with its output shown under `-Repair`.
+- **`-Repair` also restores the Windows 10 style context menu.** A registry verb
+  cannot be promoted to the Windows 11 top-level menu at all: that requires
+  `IExplorerCommand` plus package identity. Neutralising the modern provider's
+  CLSID per user is the only mechanism available, and it is a machine-wide shell
+  preference that only takes effect when Explorer restarts — so the silent pass
+  never touches it and only an explicit `-Repair` offers it.
+- `-Doctor` reports the state of WinRegister's own install alongside the
+  registrations, and says how to enable the classic menu rather than only that
+  it is off.
+- Thirteen self-test cases covering verb rebuilding, `AppliesTo` preservation,
+  Apps & Features ownership, rival-installer detection, and shortcut icons.
+
+### Changed
+- `-Install` and the healer now share one context-menu writer, so the two can
+  no longer come to describe the menu differently. It creates only keys that are
+  missing: `New-Item -Force` on an existing registry key deletes that key's
+  values, and `AppliesTo` lives on the verb key — blanking it does not fail open
+  harmlessly, it shows both verbs on every item at once.
+- An install marker records that WinRegister is installed, so the footprint
+  healer cannot resurrect the context menu after an uninstall. Installs that
+  predate the marker are adopted automatically.
+- `-Install -SkipSelfArp` (the Inno Setup path) now records that an installer
+  owns the Apps & Features entry, so the healer never writes a second identical
+  row beside it.
+
 ## [1.5.0] - 2026-09-08
 
 ### Fixed

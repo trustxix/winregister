@@ -44,14 +44,20 @@
     List all programs currently registered by WinRegister.
 
 .PARAMETER Repair
-    Run the self-heal pass with full output: relocate registrations whose program
-    has moved, rebuild missing artefacts, and drop entries that are truly gone.
+    Run the self-heal pass with full output: restore anything missing from
+    WinRegister's own install, relocate registrations whose program has moved,
+    rebuild missing artefacts, and drop entries that are truly gone. This is
+    also the only mode that turns the Windows 10 style context menu back on,
+    because that is a machine-wide shell preference rather than WinRegister's
+    own property.
 
 .PARAMETER SelfHeal
-    The same pass, silent. Runs automatically before every other action and from
-    a per-user scheduled task at logon and daily, so a program that is updated,
-    moved, or reinstalled elsewhere keeps its Start Menu entry, its Run-dialog
-    name, and its Apps & Features record without the user doing anything.
+    The same pass, silent, minus the shell preference. Runs automatically before
+    every other action and from a per-user scheduled task at logon and daily, so
+    a program that is updated, moved, or reinstalled elsewhere keeps its Start
+    Menu entry, its Run-dialog name, and its Apps & Features record without the
+    user doing anything - and so WinRegister's own install repairs itself
+    without ever needing a reinstall.
 
 .PARAMETER Doctor
     Print a diagnostic snapshot: install state, context menu, registry sanity,
@@ -4845,7 +4851,7 @@ function Show-Help {
     Write-Host "  .\WinRegister.ps1 -List                     Show all WinRegister registrations" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -Settings                 Open the settings dialog" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -CheckUpdate              Check for a newer release now" -ForegroundColor Gray
-    Write-Host "  .\WinRegister.ps1 -Repair                   Follow moved programs, rebuild artefacts, drop dead entries" -ForegroundColor Gray
+    Write-Host "  .\WinRegister.ps1 -Repair                   Restore the install, follow moved programs, drop dead entries" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -SelfHeal                 The same pass, silent (runs automatically)" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -Doctor                   Diagnostic snapshot of install + registrations" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -SelfTest                 Run internal verification suite" -ForegroundColor Gray
@@ -4854,8 +4860,9 @@ function Show-Help {
     Write-Host "  .\WinRegister.ps1 -Uninstall -Purge         Also remove every registration" -ForegroundColor Gray
     Write-Host ""
     Write-Host "After installing, right-click any program file or its folder and choose" -ForegroundColor Gray
-    Write-Host "'Register with Windows'. On Windows 11 this lives under 'Show more options'" -ForegroundColor Gray
-    Write-Host "(or use Shift+Right-click)." -ForegroundColor Gray
+    Write-Host "'Register with Windows'. On Windows 11 a registry verb cannot appear on the" -ForegroundColor Gray
+    Write-Host "top-level menu at all, so it lives under 'Show more options' (or Shift+Right-" -ForegroundColor Gray
+    Write-Host "click) unless the Windows 10 style menu is on - run -Repair to turn it on." -ForegroundColor Gray
     Write-Host ""
     Write-Host "Registrations maintain themselves: a program that is updated into a new" -ForegroundColor Gray
     Write-Host "folder, moved, or reinstalled elsewhere is found again and its Start Menu," -ForegroundColor Gray
