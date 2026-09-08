@@ -44,8 +44,14 @@
     List all programs currently registered by WinRegister.
 
 .PARAMETER Repair
-    Scan all registrations; remove entries whose target executable no longer
-    exists, and recreate missing artefacts for entries that still resolve.
+    Run the self-heal pass with full output: relocate registrations whose program
+    has moved, rebuild missing artefacts, and drop entries that are truly gone.
+
+.PARAMETER SelfHeal
+    The same pass, silent. Runs automatically before every other action and from
+    a per-user scheduled task at logon and daily, so a program that is updated,
+    moved, or reinstalled elsewhere keeps its Start Menu entry, its Run-dialog
+    name, and its Apps & Features record without the user doing anything.
 
 .PARAMETER Doctor
     Print a diagnostic snapshot: install state, context menu, registry sanity,
@@ -117,6 +123,9 @@ param(
     [Parameter(ParameterSetName = 'Repair', Mandatory)]
     [switch]$Repair,
 
+    [Parameter(ParameterSetName = 'SelfHeal', Mandatory)]
+    [switch]$SelfHeal,
+
     [Parameter(ParameterSetName = 'Doctor', Mandatory)]
     [switch]$Doctor,
 
@@ -151,7 +160,7 @@ $ErrorActionPreference = 'Stop'
 #region Configuration ----------------------------------------------------------
 
 $script:Cfg = [pscustomobject]@{
-    Version              = '1.4.0'
+    Version              = '1.5.0'
     SchemaVersion        = 2
     SettingsSchemaVersion= 2
     AppName              = 'WinRegister'
@@ -163,7 +172,18 @@ $script:Cfg = [pscustomobject]@{
     DataFolder           = Join-Path $env:LOCALAPPDATA 'WinRegister'
     InstalledScript      = Join-Path $env:LOCALAPPDATA 'WinRegister\WinRegister.ps1'
     InstalledShim        = Join-Path $env:LOCALAPPDATA 'WinRegister\winregister.cmd'
-    HiddenLauncher       = Join-Path $env:LOCALAPPDATA 'WinRegister\winregister-launcher.vbs'
+    # A compiled GUI-subsystem stub, not a script. Every scripted trampoline the
+    # shell can invoke goes through a file-extension -> handler lookup that any
+    # installed program is free to hijack: Notepad++ repoints HKCU\Software\
+    # Classes\.vbs at "Notepad++_file", which has no ScriptEngine subkey, so
+    # wscript.exe answers "There is no script engine for file extension .vbs"
+    # and the context menu dies. HKCU shadows HKLM in the HKCR merge, so a
+    # per-user hijack breaks it machine-wide. VBScript is also a deprecated
+    # Feature on Demand that Microsoft has announced for removal. A real PE with
+    # subsystem 2 has no such lookup and no such dependency.
+    HiddenLauncher       = Join-Path $env:LOCALAPPDATA 'WinRegister\winregister-launcher.exe'
+    LauncherStamp        = Join-Path $env:LOCALAPPDATA 'WinRegister\winregister-launcher.stamp'
+    LegacyVbsLauncher    = Join-Path $env:LOCALAPPDATA 'WinRegister\winregister-launcher.vbs'
     RegistryFile         = Join-Path $env:LOCALAPPDATA 'WinRegister\registrations.json'
     SettingsFile         = Join-Path $env:APPDATA       'WinRegister\settings.json'
     SettingsFolder       = Join-Path $env:APPDATA       'WinRegister'
@@ -198,6 +218,19 @@ $script:Cfg = [pscustomobject]@{
     ClassicMenuClsidKey  = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
     ClassicMenuInprocKey = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32'
     ClassicMenuMarker    = Join-Path $env:LOCALAPPDATA 'WinRegister\.classic-menu-owned-by-us'
+    # Self-heal. A registration is a set of pointers at one absolute exe path, so
+    # anything that moves the program - an updater that writes a versioned folder,
+    # a reinstall elsewhere, a drive letter change - silently breaks all of them.
+    # The healer re-finds the program and rewrites the pointers instead of
+    # deleting the registration.
+    SelfHealTaskPath     = '\WinRegister\'
+    SelfHealTaskName     = 'WinRegister Self-Heal'
+    # How far below a surviving ancestor directory to look for the moved exe.
+    RelocateScanDepth    = 5
+    # Ancestors of the dead path to try, nearest first, before giving up. Bounds
+    # the search so a program that lived at D:\A\B\C\app.exe never causes a scan
+    # of all of D:\.
+    RelocateMaxAncestors = 3
     MaxArpDisplayName    = 32
     MaxAumid             = 128
     MaxPascalSegment     = 80
@@ -327,6 +360,15 @@ function Get-DefaultSettings {
             StartMenuSubfolder   = ''        # optional subfolder under Programs (empty = top-level)
             ExtraBlacklist       = @()       # user-added blacklist patterns
             FolderScanDepth      = 4         # max recursion when scanning folders for the main .exe
+        }
+        Maintenance = [pscustomobject]@{
+            # Kill switches for the automatic healer. It rewrites and deletes
+            # registrations without asking, so each stage can be turned off
+            # independently in settings.json without disabling the others.
+            AutoHeal      = $true    # run the pass before every action + on schedule
+            AutoRelocate  = $true    # follow a program that moved instead of dropping it
+            AutoPrune     = $true    # drop a registration once the program is unfindable
+            ScheduledTask = $true    # keep the logon/daily task registered
         }
         Modified = (Get-Date).ToString('o')
     }
@@ -1679,7 +1721,13 @@ function Set-UninstallEntry {
         -f $script:Cfg.InstalledScript, $ExePath)
     $quietCmd = $uninstallCmd + ' -Silent -NoConfirm'
 
-    $estimatedKb = [int]([Math]::Max(0, $InstallSize) / 1KB)
+    # [Math]::Max(0, $x) binds the Max(int,int) overload because the literal is
+    # an int, so any folder over 2GB threw and cost the program its ARP entry
+    # entirely - a 23GB game server directory is what surfaced this. Both
+    # arguments must be int64. EstimatedSize is a DWORD, so clamp after the
+    # divide as well.
+    $estimatedBytes = [Math]::Max([int64]0, [int64]$InstallSize)
+    $estimatedKb = [int][Math]::Min([int64][int]::MaxValue, [int64]($estimatedBytes / 1KB))
     $installDate = (Get-Date).ToString('yyyyMMdd')
 
     Set-ItemProperty -LiteralPath $keyPath -Name 'DisplayName'          -Value $arpName              -Type String
@@ -1713,6 +1761,505 @@ function Remove-ShortcutFile {
     if ($Path -and (Test-Path -LiteralPath $Path)) {
         Remove-Item -LiteralPath $Path -Force
         Write-Log "Removed shortcut: $Path"
+    }
+}
+
+function Get-ShortcutTarget {
+    # Reads a .lnk's target. Uses the WScript.Shell COM class, which is resolved
+    # by CLSID and is therefore unaffected by the .vbs file-extension hijack that
+    # breaks script-engine launching (see Cfg.HiddenLauncher).
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    $shell = $null
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        return $shell.CreateShortcut($Path).TargetPath
+    } catch {
+        Write-Log "Could not read shortcut target for ${Path}: $_" -Level Warn
+        return $null
+    } finally {
+        if ($shell) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) }
+    }
+}
+
+#endregion
+
+#region Self-heal (relocation, artefact repair, pruning) ----------------------
+# A registration is nothing but a set of pointers at one absolute exe path, so
+# anything that moves the program breaks every one of them at once. Portable
+# apps move constantly: updaters unpack into a versioned sibling folder, the
+# user reorganises a tools drive, a reinstall lands elsewhere. Deleting the
+# registration in that case is the wrong answer - the program still exists and
+# the user still wants it in Search. This pass re-finds it and rewrites the
+# pointers, and only prunes once the program is genuinely unfindable.
+
+function Get-ExeIdentity {
+    param([string]$Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $vi = $item.VersionInfo
+        return [pscustomobject]@{
+            FileName    = $item.Name
+            BaseName    = $item.BaseName
+            ProductName = Get-CleanString $vi.ProductName
+            FileDesc    = Get-CleanString $vi.FileDescription
+            Company     = Get-CleanString $vi.CompanyName
+            Version     = Get-CleanString $vi.ProductVersion
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Get-ProgramMatchScore {
+    # How strongly does $CandidatePath look like the program $Entry used to point
+    # at? The recorded DisplayName may be a user override rather than the exe's
+    # ProductName, so no single signal is required - but a publisher that
+    # positively disagrees is treated as proof of a different program, which is
+    # what stops a same-named helper binary from hijacking a registration.
+    param($Entry, [string]$CandidatePath)
+
+    $cand = Get-ExeIdentity -Path $CandidatePath
+    if (-not $cand) { return 0 }
+
+    $oldExe    = Get-SafeProperty $Entry 'ExePath'
+    $oldName   = if ($oldExe) { [System.IO.Path]::GetFileName($oldExe) } else { '' }
+    $recName   = Get-SafeProperty $Entry 'DisplayName' -Default ''
+    $recVendor = Get-SafeProperty $Entry 'Vendor'      -Default ''
+
+    $score = 0
+    if ($oldName -and ($cand.FileName -ieq $oldName)) { $score += 3 }
+    if ($recName -and (($cand.ProductName -ieq $recName) -or ($cand.FileDesc -ieq $recName))) { $score += 2 }
+    if ($recVendor -and $cand.Company) {
+        if ($cand.Company -ieq $recVendor) { $score += 2 } else { $score -= 3 }
+    }
+    return $score
+}
+
+function Test-IsSearchableRoot {
+    # Guards the ancestor walk. Scanning a drive root or a top-level user folder
+    # to find one moved exe would take minutes and could match anything; a
+    # registration is not worth that, so the walk stops and the entry is pruned.
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $p = $Path.TrimEnd('\')
+    if ($p -match '^[A-Za-z]:$') { return $false }
+    $forbidden = @(
+        $env:USERPROFILE, $env:APPDATA, $env:LOCALAPPDATA, $env:ProgramData,
+        $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:WINDIR,
+        $env:TEMP, $env:TMP,
+        # The AppData container itself has no environment variable of its own,
+        # and it is the parent of every folder above - so without it, a walk
+        # that steps over Local or Roaming lands on the whole profile.
+        (Split-Path -Path $env:LOCALAPPDATA -Parent),
+        (Join-Path $env:USERPROFILE 'Desktop'), (Join-Path $env:USERPROFILE 'Documents'),
+        (Join-Path $env:USERPROFILE 'Downloads')
+    ) | Where-Object { $_ }
+    foreach ($f in $forbidden) {
+        if ($p -ieq $f.TrimEnd('\')) { return $false }
+    }
+    return $true
+}
+
+function Get-RelocationSearchRoot {
+    # Candidate directories to search, nearest-first. An updater that writes
+    # "App-2.1.0" beside "App-2.0.0" is found from the shared parent, so walking
+    # up a bounded number of ancestors covers the common case without turning
+    # into a disk-wide scan.
+    param($Entry)
+
+    $roots = New-Object System.Collections.Generic.List[string]
+    $seen  = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    $add = {
+        param([string]$Dir)
+        if (-not $Dir) { return }
+        if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { return }
+        if (-not (Test-IsSearchableRoot -Path $Dir)) { return }
+        if ($seen.Add($Dir)) { [void]$roots.Add($Dir) }
+    }
+
+    # What the user originally right-clicked, when that was a folder.
+    $source = Get-SafeProperty $Entry 'SourcePath'
+    if ($source -and (Test-Path -LiteralPath $source -PathType Container)) { & $add $source }
+
+    # Climb to the nearest directory that still exists, then search from there.
+    # A fixed number of steps is not enough: reorganising a program can rename
+    # its whole branch at once, and a real case on the author's machine moved an
+    # exe out from four nested folders that all vanished together. What keeps
+    # this from walking to a drive root is the searchable-root guard, not a
+    # step count.
+    $exe = Get-SafeProperty $Entry 'ExePath'
+    if ($exe) {
+        $dir = Split-Path -Path $exe -Parent
+        while ($dir -and -not (Test-Path -LiteralPath $dir -PathType Container)) {
+            $parent = Split-Path -Path $dir -Parent
+            if (-not $parent -or $parent -ieq $dir) { $dir = $null; break }
+            if (-not (Test-IsSearchableRoot -Path $parent)) { $dir = $null; break }
+            $dir = $parent
+        }
+        # The surviving ancestor, plus a bounded number above it for the case
+        # where the program moved sideways into a different branch. The walk
+        # stops dead at the first ancestor that is too broad to search rather
+        # than skipping it and carrying on: everything above a rejected
+        # directory is broader still, and climbing through one is how a search
+        # rooted in a temp folder ends up enumerating all of %APPDATA%.
+        for ($i = 0; $i -le $script:Cfg.RelocateMaxAncestors -and $dir; $i++) {
+            if (-not (Test-IsSearchableRoot -Path $dir)) { break }
+            & $add $dir
+            $parent = Split-Path -Path $dir -Parent
+            if (-not $parent -or $parent -ieq $dir) { break }
+            $dir = $parent
+        }
+    }
+    return $roots
+}
+
+function Find-RelocatedExecutable {
+    # Best-scoring surviving executable that still looks like this registration's
+    # program, or $null. Returns the path only; the caller decides what to do.
+    #
+    # $ClaimedPaths are exe paths other registrations already point at. Without
+    # it, two entries for related programs living under one parent folder can
+    # both relocate onto whichever exe scores best, silently collapsing two
+    # registrations into one.
+    param($Entry, [string[]]$ClaimedPaths = @())
+
+    $claimed = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($c in $ClaimedPaths) { if ($c) { [void]$claimed.Add($c) } }
+
+    $best = $null; $bestScore = 0
+    $examined = 0
+    $cap = 6000   # hard ceiling on files inspected across all roots
+
+    foreach ($root in (Get-RelocationSearchRoot -Entry $Entry)) {
+        $candidates = @()
+        try {
+            $candidates = @(Get-ChildItem -LiteralPath $root -Filter *.exe -File -Recurse `
+                -Depth $script:Cfg.RelocateScanDepth -Force -ErrorAction SilentlyContinue)
+        } catch {
+            Write-Log "Relocation scan failed under ${root}: $_" -Level Warn
+            continue
+        }
+
+        foreach ($c in $candidates) {
+            if ($examined -ge $cap) {
+                Write-Log ("Relocation scan hit the {0}-file cap under {1}; " -f $cap, $root +
+                           "stopping the search for this entry.") -Level Warn
+                break
+            }
+            $examined++
+
+            if ($claimed.Contains($c.FullName)) { continue }
+            if (Test-ProtectedPath -Path $c.FullName) { continue }
+            if (Test-IsBlacklisted -ExeBaseName $c.BaseName) { continue }
+
+            $score = Get-ProgramMatchScore -Entry $Entry -CandidatePath $c.FullName
+            if ($score -gt $bestScore) {
+                if (-not (Test-IsValidExecutable -Path $c.FullName)) { continue }
+                $best = $c.FullName; $bestScore = $score
+            }
+        }
+
+        # A hit under a nearer root always beats one further up the tree, so stop
+        # as soon as a root produces a confident match.
+        if ($bestScore -ge 3) { break }
+        if ($examined -ge $cap) { break }
+    }
+
+    if ($bestScore -ge 3) {
+        Write-Log "Relocation candidate for '$(Get-SafeProperty $Entry 'DisplayName')': $best (score $bestScore)"
+        return $best
+    }
+    return $null
+}
+
+function Repair-RegistrationArtifact {
+    # Brings the three artefacts back in line with the entry. Covers the case
+    # where the program stayed put but something else drifted: the user deleted
+    # the Start Menu shortcut, an installer overwrote our App Paths key, or the
+    # app updated in place and its version string moved on.
+    param($Entry, [switch]$Quiet)
+
+    $repaired = @()
+    $exe   = Get-SafeProperty $Entry 'ExePath'
+    $appId = Get-SafeProperty $Entry 'AppId'
+    $name  = Get-SafeProperty $Entry 'DisplayName' -Default '(unnamed)'
+    $sc    = Get-SafeProperty $Entry 'ShortcutPath'
+
+    if (-not $exe -or -not $appId) { return $repaired }
+
+    # Shortcut: missing, or pointing somewhere other than the recorded exe.
+    if ($sc) {
+        $target = Get-ShortcutTarget -Path $sc
+        if (-not (Test-Path -LiteralPath $sc) -or ($target -and $target -ine $exe)) {
+            try {
+                New-StartMenuShortcut -ShortcutPath $sc -TargetPath $exe -DisplayName $name `
+                    -AppUserModelId $appId -Description $name -WorkingDirectory (Split-Path $exe -Parent)
+                $repaired += 'shortcut'
+            } catch {
+                Write-Log "Shortcut repair failed for ${name}: $_" -Level Warn
+            }
+        }
+    }
+
+    # App Paths: only rewrite a key we still own, never one another installer claimed.
+    $apKey = Get-SafeProperty $Entry 'AppPathsKey'
+    if ($apKey) {
+        $keyPath = Join-Path $script:Cfg.AppPathsRoot $apKey
+        $current = $null
+        if (Test-Path -LiteralPath $keyPath) {
+            $current = (Get-ItemProperty -LiteralPath $keyPath -ErrorAction SilentlyContinue).'(default)'
+        }
+        if ($current -ine $exe) {
+            if (Test-AppPathsCollision -KeyName $apKey -ExePath $exe) {
+                Write-Log "App Paths key '$apKey' now belongs to another program; leaving it alone." -Level Warn
+            } else {
+                try {
+                    if (-not (Test-Path -LiteralPath $keyPath)) { New-Item -Path $keyPath -Force | Out-Null }
+                    Set-ItemProperty -LiteralPath $keyPath -Name '(Default)' -Value $exe -Type String
+                    $repaired += 'app-paths'
+                } catch {
+                    Write-Log "App Paths repair failed for ${name}: $_" -Level Warn
+                }
+            }
+        }
+    }
+
+    # ARP: missing entirely, or stale after an in-place update.
+    $arpKey = Join-Path $script:Cfg.UninstallRoot $appId
+    $liveVersion = ''
+    try { $liveVersion = (Get-ExeIdentity -Path $exe).Version } catch { }
+    $arpStale = $true
+    if (Test-Path -LiteralPath $arpKey) {
+        $p = Get-ItemProperty -LiteralPath $arpKey -ErrorAction SilentlyContinue
+        $arpStale = ((Get-SafeProperty $p 'DisplayIcon') -ine $exe) -or
+                    ($liveVersion -and ((Get-SafeProperty $p 'DisplayVersion') -ine $liveVersion))
+    }
+    if ($arpStale) {
+        try {
+            $size = 0
+            try { $size = Get-DirectorySize -Path (Split-Path $exe -Parent) } catch { }
+            Set-UninstallEntry -AppId $appId -DisplayName $name -ExePath $exe `
+                -Vendor (Get-SafeProperty $Entry 'Vendor' -Default '') `
+                -Version $(if ($liveVersion) { $liveVersion } else { Get-SafeProperty $Entry 'Version' -Default '' }) `
+                -InstallSize $size
+            $repaired += 'arp'
+        } catch {
+            Write-Log "ARP repair failed for ${name}: $_" -Level Warn
+        }
+    }
+
+    # Record the version the program is actually on now.
+    if ($liveVersion -and ($liveVersion -ne (Get-SafeProperty $Entry 'Version'))) {
+        Add-Member -InputObject $Entry -NotePropertyName 'Version' -NotePropertyValue $liveVersion -Force
+        $repaired += 'version'
+    }
+
+    if ($repaired.Count -gt 0 -and -not $Quiet) {
+        Write-Host ("  REPAIR  {0}  ({1})" -f $name, ($repaired -join ', ')) -ForegroundColor Cyan
+    }
+    if ($repaired.Count -gt 0) {
+        Write-Log "Repaired $name`: $($repaired -join ', ')"
+    }
+    return $repaired
+}
+
+function New-RelocatedEntry {
+    # Rebuilds a registration against a new exe path and returns the new entry.
+    # The AppId is derived from the path, so moving the program necessarily mints
+    # a new one - the old artefacts are torn down first so the move leaves nothing
+    # orphaned behind it.
+    param($Entry, [string]$NewExePath)
+
+    $name = Get-SafeProperty $Entry 'DisplayName' -Default '(unnamed)'
+    $meta = Get-ProgramMetadata -ExePath $NewExePath
+    # A user-chosen name outranks whatever the new binary claims about itself.
+    $meta.DisplayName = $name
+
+    Remove-ShortcutFile   -Path    (Get-SafeProperty $Entry 'ShortcutPath')
+    Remove-AppPathsEntry  -KeyName (Get-SafeProperty $Entry 'AppPathsKey')
+    Remove-UninstallEntry -AppId   (Get-SafeProperty $Entry 'AppId')
+
+    $newAppId = New-AppId -DisplayName $name -ExePath $meta.ExePath
+
+    # Keep the shortcut where it was so the user's Start Menu layout survives.
+    $shortcutPath = Get-SafeProperty $Entry 'ShortcutPath'
+    if (-not $shortcutPath) {
+        $shortcutPath = Join-Path $script:Cfg.StartMenuFolder `
+            ("{0}.lnk" -f (Get-SafeFilename -Text $name -Fallback $meta.BaseName))
+    }
+
+    New-StartMenuShortcut -ShortcutPath $shortcutPath -TargetPath $meta.ExePath -DisplayName $name `
+        -AppUserModelId $newAppId -Description $name -WorkingDirectory $meta.WorkingDir
+
+    $appPathsKey = $null
+    try { $appPathsKey = Set-AppPathsEntry -ExeBaseName $meta.BaseName -ExePath $meta.ExePath }
+    catch { Write-Log "App Paths after relocation failed (non-fatal): $_" -Level Warn }
+
+    $installSize = 0
+    try { $installSize = Get-DirectorySize -Path $meta.WorkingDir } catch { }
+    try {
+        Set-UninstallEntry -AppId $newAppId -DisplayName $name -ExePath $meta.ExePath `
+            -Vendor $meta.Vendor -Version $meta.Version -InstallSize $installSize
+    } catch { Write-Log "ARP after relocation failed (non-fatal): $_" -Level Warn }
+
+    # SourcePath followed the program: a folder registration whose folder moved
+    # should now describe the new folder, or the context menu would keep offering
+    # "Unregister" on a directory that no longer holds the program.
+    $oldSource = Get-SafeProperty $Entry 'SourcePath'
+    $newSource = $meta.ExePath
+    if ($oldSource) {
+        $oldExt = [System.IO.Path]::GetExtension($oldSource).ToLowerInvariant()
+        if ($oldExt -ne '.exe' -and $oldExt -ne '.lnk') { $newSource = $meta.WorkingDir }
+        elseif ($oldExt -eq '.lnk' -and (Test-Path -LiteralPath $oldSource)) { $newSource = $oldSource }
+    }
+
+    return [pscustomobject]@{
+        AppId         = $newAppId
+        DisplayName   = $name
+        ExePath       = $meta.ExePath
+        ShortcutPath  = $shortcutPath
+        AppPathsKey   = $appPathsKey
+        Vendor        = $meta.Vendor
+        Version       = $meta.Version
+        InstallSize   = $installSize
+        RegisteredAt  = (Get-SafeProperty $Entry 'RegisteredAt' -Default ((Get-Date).ToString('o')))
+        SourcePath    = (Get-CanonicalShellPath -Path $newSource)
+        RelocatedAt   = (Get-Date).ToString('o')
+        RelocatedFrom = (Get-SafeProperty $Entry 'ExePath')
+    }
+}
+
+function Invoke-SelfHeal {
+    # The automatic maintenance pass. Detection is three file-existence checks per
+    # registration, so it is cheap enough to run before every action; the
+    # expensive relocation scan only ever runs for an entry that is already dead.
+    param([switch]$Quiet)
+
+    $prefs = Get-Settings
+    $maint = Get-SafeProperty $prefs 'Maintenance'
+    $doRelocate = [bool](Get-SafeProperty $maint 'AutoRelocate' -Default $true)
+    $doPrune    = [bool](Get-SafeProperty $maint 'AutoPrune'    -Default $true)
+
+    $summary = [pscustomobject]@{
+        Healthy = 0; Repaired = 0; Relocated = 0; Pruned = 0; Stranded = 0
+    }
+
+    $store = Get-RegistrationStore
+    if ($store.Count -eq 0) {
+        Update-ContextMenuConditions
+        return $summary
+    }
+
+    # Planned mutations, applied together under a single store lock at the end.
+    $replacements = [ordered]@{}   # oldKey -> new entry
+    $removals     = @()
+    $touched      = [ordered]@{}   # key -> entry mutated in place
+
+    # Every exe some other registration already owns. Relocation must not pick
+    # one of these, or two entries silently converge on a single program.
+    $claimed = New-Object System.Collections.Generic.List[string]
+    foreach ($k in $store.Keys) {
+        $p = Get-SafeProperty $store[$k] 'ExePath'
+        if ($p -and (Test-Path -LiteralPath $p)) { [void]$claimed.Add($p) }
+    }
+
+    foreach ($key in @($store.Keys)) {
+        $entry = $store[$key]
+        $name  = Get-SafeProperty $entry 'DisplayName' -Default '(unnamed)'
+        $exe   = Get-SafeProperty $entry 'ExePath'
+
+        if ($exe -and (Test-Path -LiteralPath $exe)) {
+            $fixed = Repair-RegistrationArtifact -Entry $entry -Quiet:$Quiet
+            if ($fixed.Count -gt 0) { $summary.Repaired++; $touched[$key] = $entry }
+            else { $summary.Healthy++ }
+            continue
+        }
+
+        if (-not $doRelocate) {
+            if (-not $doPrune) {
+                $summary.Stranded++
+                continue
+            }
+        } else {
+            $newPath = $null
+            try { $newPath = Find-RelocatedExecutable -Entry $entry -ClaimedPaths $claimed }
+            catch { Write-Log "Relocation search failed for ${name}: $_" -Level Warn }
+
+            if ($newPath) {
+                try {
+                    $replacements[$key] = New-RelocatedEntry -Entry $entry -NewExePath $newPath
+                    [void]$claimed.Add($newPath)
+                    $summary.Relocated++
+                    if (-not $Quiet) {
+                        Write-Host ("  MOVED   {0}" -f $name) -ForegroundColor Green
+                        Write-Host ("            {0}" -f $exe)     -ForegroundColor DarkGray
+                        Write-Host ("         -> {0}" -f $newPath) -ForegroundColor Gray
+                    }
+                    Write-Log "Relocated '$name': $exe -> $newPath"
+                    continue
+                } catch {
+                    Write-Log "Relocation of '$name' failed, leaving entry intact: $_" -Level Error
+                    $summary.Stranded++
+                    continue
+                }
+            }
+        }
+
+        if (-not $doPrune) {
+            $summary.Stranded++
+            if (-not $Quiet) {
+                Write-Host ("  DEAD    {0}  (pruning disabled)" -f $name) -ForegroundColor Yellow
+            }
+            continue
+        }
+
+        try {
+            Remove-ShortcutFile   -Path    (Get-SafeProperty $entry 'ShortcutPath')
+            Remove-AppPathsEntry  -KeyName (Get-SafeProperty $entry 'AppPathsKey')
+            Remove-UninstallEntry -AppId   (Get-SafeProperty $entry 'AppId')
+        } catch {
+            Write-Log "Prune cleanup warning for ${name}: $_" -Level Warn
+        }
+        $removals += $key
+        $summary.Pruned++
+        if (-not $Quiet) {
+            Write-Host ("  REMOVE  {0}  (program not found anywhere near {1})" -f $name, $exe) -ForegroundColor Yellow
+        }
+        Write-Log "Pruned '$name' (target gone: $exe)"
+    }
+
+    if ($replacements.Count -or $removals.Count -or $touched.Count) {
+        Edit-RegistrationStore {
+            param($live)
+            foreach ($k in $removals) { $live.Remove($k) }
+            foreach ($k in $touched.Keys) { if ($live.Contains($k)) { $live[$k] = $touched[$k] } }
+            foreach ($k in $replacements.Keys) {
+                $new = $replacements[$k]
+                $live.Remove($k)
+                $live[$new.AppId] = $new
+            }
+        }.GetNewClosure()
+    }
+
+    Update-ContextMenuConditions
+    Write-Log ("Self-heal: {0} healthy, {1} repaired, {2} relocated, {3} pruned, {4} stranded" -f
+        $summary.Healthy, $summary.Repaired, $summary.Relocated, $summary.Pruned, $summary.Stranded)
+    return $summary
+}
+
+function Invoke-AutoHeal {
+    # The always-on hook. Wrapped so that a failure here can never stop the
+    # action the user actually asked for.
+    try {
+        $prefs = Get-Settings
+        $maint = Get-SafeProperty $prefs 'Maintenance'
+        if (-not [bool](Get-SafeProperty $maint 'AutoHeal' -Default $true)) { return }
+        Repair-LauncherWiring
+        Confirm-SelfHealTask -Maintenance $maint
+        [void](Invoke-SelfHeal -Quiet)
+    } catch {
+        Write-Log "Automatic self-heal pass failed (non-fatal): $_" -Level Warn
     }
 }
 
@@ -1884,6 +2431,7 @@ function Show-ToastMessage {
         [ValidateSet('Info', 'Warning', 'Error')] [string]$Level = 'Info'
     )
     if ($Silent -and $Level -eq 'Info') { return }
+    if ($script:SuppressDialogs) { Write-Log "Toast suppressed: $Title - $Message"; return }
 
     Initialize-DpiAwareness
     Add-Type -AssemblyName System.Windows.Forms
@@ -1933,6 +2481,14 @@ function Show-ToastMessage {
 
 function Show-ErrorDialog {
     param([string]$Message)
+    # A modal box blocks its caller until someone clicks it. That is correct for
+    # a context-menu invocation and unacceptable for the verification suite,
+    # which must run to completion unattended and without drawing on the screen.
+    if ($script:SuppressDialogs) {
+        Write-Host "  [dialog suppressed] $Message" -ForegroundColor DarkYellow
+        Write-Log "Dialog suppressed: $Message" -Level Warn
+        return
+    }
     Initialize-DpiAwareness
     Add-Type -AssemblyName System.Windows.Forms
     [System.Windows.Forms.MessageBox]::Show(
@@ -1942,6 +2498,7 @@ function Show-ErrorDialog {
 
 function Show-ConfirmYesNo {
     param([string]$Title, [string]$Message)
+    if ($script:SuppressDialogs) { Write-Log "Confirm suppressed (declined): $Title"; return $false }
     Initialize-DpiAwareness
     Add-Type -AssemblyName System.Windows.Forms
     $result = [System.Windows.Forms.MessageBox]::Show(
@@ -2715,7 +3272,13 @@ function Show-RegistrationList {
 }
 
 function Invoke-Repair {
+    # The self-heal pass with its output shown. Identical work to the automatic
+    # pass, so -Repair is now a way to watch what the healer does rather than a
+    # separate, weaker implementation of it.
     Write-Log "===== Repair requested ====="
+
+    Repair-LauncherWiring
+
     $store = Get-RegistrationStore
     if ($store.Count -eq 0) {
         # Still resync the menu: an emptied or deleted registrations.json is
@@ -2726,50 +3289,15 @@ function Invoke-Repair {
         return
     }
 
-    $removed = 0; $rebuilt = 0; $ok = 0
-    foreach ($key in @($store.Keys)) {
-        $entry = $store[$key]
-        $name = Get-SafeProperty $entry 'DisplayName' -Default '(unnamed)'
-        $exe  = Get-SafeProperty $entry 'ExePath'
-        $sc   = Get-SafeProperty $entry 'ShortcutPath'
-
-        if (-not $exe -or -not (Test-Path -LiteralPath $exe)) {
-            Write-Host "  REMOVE $name  (target gone)" -ForegroundColor Yellow
-            Remove-ShortcutFile -Path $sc
-            Remove-AppPathsEntry -KeyName (Get-SafeProperty $entry 'AppPathsKey')
-            Remove-UninstallEntry -AppId  (Get-SafeProperty $entry 'AppId')
-            $store.Remove($key)
-            $removed++
-            continue
-        }
-
-        if ($sc -and -not (Test-Path -LiteralPath $sc)) {
-            Write-Host "  REBUILD $name  (shortcut missing)" -ForegroundColor Cyan
-            try {
-                New-StartMenuShortcut `
-                    -ShortcutPath $sc `
-                    -TargetPath $exe `
-                    -DisplayName $name `
-                    -AppUserModelId (Get-SafeProperty $entry 'AppId') `
-                    -Description $name `
-                    -WorkingDirectory (Split-Path $exe -Parent)
-                $rebuilt++
-            } catch {
-                Write-Log "Rebuild failed for $name`: $_" -Level Warn
-            }
-            continue
-        }
-
-        $ok++
-    }
-
-    Save-RegistrationStore -Store $store
-    # Also the self-heal path for the menu: rebuilds both conditions from the
-    # live store, so a hand-edited or stale registrations.json corrects itself.
-    Update-ContextMenuConditions
     Write-Host ""
-    Write-Host "Repair complete: $ok healthy, $rebuilt rebuilt, $removed removed." -ForegroundColor Green
-    Write-Log "Repair: ok=$ok rebuilt=$rebuilt removed=$removed"
+    $s = Invoke-SelfHeal
+    Write-Host ""
+    Write-Host ("Repair complete: {0} healthy, {1} repaired, {2} relocated, {3} removed." -f
+        $s.Healthy, $s.Repaired, $s.Relocated, $s.Pruned) -ForegroundColor Green
+    if ($s.Stranded -gt 0) {
+        Write-Host ("{0} entr(y/ies) left in place - the program is missing but automatic " -f $s.Stranded +
+                    "relocation or pruning is disabled in settings.json.") -ForegroundColor Yellow
+    }
 }
 
 function Invoke-Doctor {
@@ -2794,7 +3322,10 @@ function Invoke-Doctor {
     $classic   = Test-ClassicMenuEnabled
     $ownClassic= Test-Path -LiteralPath $script:Cfg.ClassicMenuMarker
     Write-Host "  Installed script:    $(if ($installed) {'OK'} else {'MISSING - run Install.cmd'})" -ForegroundColor $(if ($installed) {'Green'} else {'Yellow'})
-    Write-Host "  Hidden launcher:     $(if ($launcher) {'OK'} else {'MISSING'})" -ForegroundColor $(if ($launcher) {'Green'} else {'Yellow'})
+    $launcherKind = if ($launcher) { 'OK (compiled, no console)' }
+                    elseif (Test-Path -LiteralPath $script:Cfg.LegacyVbsLauncher) { 'LEGACY VBScript - broken if .vbs is hijacked' }
+                    else { 'MISSING - falling back to powershell.exe' }
+    Write-Host "  Hidden launcher:     $launcherKind" -ForegroundColor $(if ($launcher) {'Green'} else {'Yellow'})
     Write-Host "  Registry file:       $(if ($registry) {'OK'} else {'(empty - no registrations yet)'})" -ForegroundColor $(if ($registry) {'Green'} else {'Yellow'})
     $classicSrc = if ($classic) { if ($ownClassic) { 'enabled by WinRegister' } else { 'enabled (set externally)' } } else { 'disabled - entries hide under Show more options' }
     Write-Host "  Classic menu (Win11):$classicSrc" -ForegroundColor $(if ($classic) {'Green'} else {'Yellow'})
@@ -2851,7 +3382,23 @@ function Invoke-Doctor {
         if ($dead -gt 0) {
             Write-Host "    $dead with missing targets (run -Repair)" -ForegroundColor Yellow
         }
+        $moved = @($store.Keys | Where-Object { Get-SafeProperty $store[$_] 'RelocatedAt' }).Count
+        if ($moved -gt 0) {
+            Write-Host "    $moved followed to a new location automatically" -ForegroundColor Gray
+        }
     }
+
+    Write-Host ""
+    Write-Host "  Automatic maintenance:" -ForegroundColor White
+    $maint = Get-SafeProperty (Get-Settings) 'Maintenance'
+    foreach ($knob in 'AutoHeal', 'AutoRelocate', 'AutoPrune') {
+        $on = [bool](Get-SafeProperty $maint $knob -Default $true)
+        Write-Host ("    {0} {1}" -f $(if ($on) {'[OK]'} else {'[--]'}), $knob) -ForegroundColor $(if ($on) {'Green'} else {'DarkGray'})
+    }
+    $taskState = Get-SelfHealTaskState
+    $taskOk = $taskState -eq 'ready' -or $taskState -eq 'running'
+    Write-Host ("    {0} scheduled task -> {1}" -f $(if ($taskOk) {'[OK]'} else {'[!!]'}), $taskState) `
+        -ForegroundColor $(if ($taskOk) {'Green'} else {'Yellow'})
     Write-Host ""
 }
 
@@ -2859,25 +3406,282 @@ function Invoke-Doctor {
 
 #region Install / Uninstall (context menu wiring) -----------------------------
 
+function Get-CSharpCompiler {
+    # csc.exe from the in-box .NET Framework 4 targeting pack. Present on every
+    # supported Windows and invoked directly rather than through Add-Type, whose
+    # -OutputAssembly behaviour differs between Windows PowerShell and
+    # PowerShell 7 - the launcher must build identically under both.
+    @(
+        (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe')
+        (Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
+
+function Get-LauncherStampValue {
+    # Identifies the build the launcher on disk was produced from, so a version
+    # upgrade or a moved install rebuilds it and nothing else does.
+    param([string]$Mode = 'exe')
+    return ('{0}|{1}|{2}' -f $script:Cfg.Version, $script:Cfg.InstalledScript, $Mode)
+}
+
 function Write-HiddenLauncher {
-    # Generates a tiny VBScript trampoline that invokes PowerShell with
-    # WindowStyle 0 (no console flash). Replaces the brief flicker that
-    # `-WindowStyle Hidden` alone leaves behind on context-menu invocations.
-    $launcher = @"
-' WinRegister hidden launcher
-' Auto-generated by WinRegister.ps1 - do not edit.
-Option Explicit
-Dim sh, args, cmd, i
-Set sh = CreateObject("WScript.Shell")
-Set args = WScript.Arguments
-cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""$($script:Cfg.InstalledScript)"""
-For i = 0 To args.Count - 1
-    cmd = cmd & " " & """" & args(i) & """"
-Next
-sh.Run cmd, 0, False
+    # Builds the compiled trampoline: a GUI-subsystem PE that re-launches this
+    # script through powershell.exe with no window at any point. Returns $true if
+    # the executable was produced, $false if the caller must fall back to
+    # invoking powershell.exe directly (which works, but flashes a console).
+    $csc = Get-CSharpCompiler
+    if (-not $csc) {
+        Write-Log "No C# compiler found; launcher will fall back to powershell.exe." -Level Warn
+        Set-Content -LiteralPath $script:Cfg.LauncherStamp -Encoding ASCII `
+            -Value (Get-LauncherStampValue -Mode 'fallback')
+        return $false
+    }
+
+    # Windows paths cannot contain a double quote, but a verbatim C# literal is
+    # only safe if one is doubled, so do it rather than rely on that.
+    $scriptLiteral = $script:Cfg.InstalledScript.Replace('"', '""')
+
+    $source = @"
+using System;
+using System.Diagnostics;
+using System.Text;
+using System.Windows.Forms;
+
+// Auto-generated by WinRegister $($script:Cfg.Version). Do not edit; rebuilt on upgrade.
+internal static class Launcher
+{
+    private const string ScriptPath = @"$scriptLiteral";
+
+    // CommandLineToArgvW quoting: backslashes are only escapes when they
+    // immediately precede a quote, so run-lengths are doubled just there.
+    private static string Quote(string a)
+    {
+        StringBuilder b = new StringBuilder("\"");
+        int slashes = 0;
+        foreach (char c in a)
+        {
+            if (c == '\\') { slashes++; b.Append(c); continue; }
+            if (c == '"') { b.Append('\\', slashes + 1); }
+            slashes = 0;
+            b.Append(c);
+        }
+        b.Append('\\', slashes);
+        b.Append('"');
+        return b.ToString();
+    }
+
+    [STAThread]
+    private static int Main(string[] args)
+    {
+        StringBuilder cmd = new StringBuilder();
+        cmd.Append("-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ");
+        cmd.Append(Quote(ScriptPath));
+        foreach (string a in args) { cmd.Append(' ').Append(Quote(a)); }
+
+        ProcessStartInfo psi = new ProcessStartInfo("powershell.exe", cmd.ToString());
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        psi.WindowStyle = ProcessWindowStyle.Hidden;
+        try { Process.Start(psi); return 0; }
+        catch (Exception ex)
+        {
+            MessageBox.Show("WinRegister could not start PowerShell.\n\n" + ex.Message,
+                "WinRegister", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return 1;
+        }
+    }
+}
 "@
-    Set-Content -LiteralPath $script:Cfg.HiddenLauncher -Value $launcher -Encoding ASCII
-    Write-Log "Wrote hidden launcher: $($script:Cfg.HiddenLauncher)"
+
+    $tmpDir = Join-Path $env:TEMP ("WinRegister-launcher-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+    $srcFile = Join-Path $tmpDir 'launcher.cs'
+    $outFile = Join-Path $tmpDir 'winregister-launcher.exe'
+
+    try {
+        Set-Content -LiteralPath $srcFile -Value $source -Encoding UTF8
+
+        $cscLog = & $csc /nologo /target:winexe /optimize+ /platform:anycpu `
+            "/out:$outFile" /reference:System.dll /reference:System.Windows.Forms.dll $srcFile 2>&1
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $outFile)) {
+            Write-Log "Launcher compile failed (exit $LASTEXITCODE): $($cscLog -join '; ')" -Level Warn
+            Set-Content -LiteralPath $script:Cfg.LauncherStamp -Encoding ASCII `
+                -Value (Get-LauncherStampValue -Mode 'fallback')
+            return $false
+        }
+
+        # Built out of place and moved in, so a launcher currently executing is
+        # never the compiler's output target.
+        Copy-Item -LiteralPath $outFile -Destination $script:Cfg.HiddenLauncher -Force
+        Set-Content -LiteralPath $script:Cfg.LauncherStamp -Encoding ASCII `
+            -Value (Get-LauncherStampValue -Mode 'exe')
+        Write-Log "Built hidden launcher: $($script:Cfg.HiddenLauncher)"
+        return $true
+    } catch {
+        Write-Log "Launcher build failed: $_" -Level Warn
+        Set-Content -LiteralPath $script:Cfg.LauncherStamp -Encoding ASCII `
+            -Value (Get-LauncherStampValue -Mode 'fallback') -ErrorAction SilentlyContinue
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-LauncherCommand {
+    # The command prefix the context menu and Start Menu use to re-enter this
+    # script. Falls back to powershell.exe directly when no launcher was built:
+    # a visible console flash is a cosmetic defect, an unusable menu is not.
+    if (Test-Path -LiteralPath $script:Cfg.HiddenLauncher) {
+        return ('"{0}"' -f $script:Cfg.HiddenLauncher)
+    }
+    return ('powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' `
+        -f $script:Cfg.InstalledScript)
+}
+
+function Repair-LauncherWiring {
+    # Keeps the launcher and everything pointing at it correct, without requiring
+    # a reinstall. This is the upgrade path off the old VBScript trampoline: an
+    # existing install repairs itself on its next run instead of leaving the user
+    # with a context menu that raises "There is no script engine for file
+    # extension .vbs" every time they click it.
+    if (-not (Test-Path -LiteralPath $script:Cfg.InstalledScript)) { return }
+
+    $want = Get-LauncherStampValue -Mode 'exe'
+    $have = $null
+    if (Test-Path -LiteralPath $script:Cfg.LauncherStamp) {
+        try { $have = (Get-Content -LiteralPath $script:Cfg.LauncherStamp -Raw -ErrorAction Stop).Trim() } catch { }
+    }
+
+    # Rebuild when the executable is absent, or when the stamp does not describe
+    # this build. A recorded 'fallback' for this same build is left alone so a
+    # machine with no compiler does not re-run csc on every single invocation.
+    $needsBuild = -not (Test-Path -LiteralPath $script:Cfg.HiddenLauncher)
+    if (-not $needsBuild -and $have -ne $want) { $needsBuild = $true }
+    if ($have -eq (Get-LauncherStampValue -Mode 'fallback')) { $needsBuild = $false }
+
+    if ($needsBuild) {
+        try { [void](Write-HiddenLauncher) } catch { Write-Log "Launcher rebuild failed: $_" -Level Warn }
+    }
+
+    # Retire the VBScript trampoline once something has replaced it.
+    if ((Test-Path -LiteralPath $script:Cfg.LegacyVbsLauncher) -and
+        (Test-Path -LiteralPath $script:Cfg.HiddenLauncher)) {
+        Remove-Item -LiteralPath $script:Cfg.LegacyVbsLauncher -Force -ErrorAction SilentlyContinue
+        Write-Log "Removed the legacy VBScript launcher."
+    }
+
+    # Repoint any verb still invoking the old trampoline.
+    $launcherCmd = Get-LauncherCommand
+    foreach ($class in 'exefile', 'lnkfile', 'Directory') {
+        foreach ($pair in @(
+            @{ Verb = $script:Cfg.ContextVerbId;      Action = '-Register'   }
+            @{ Verb = $script:Cfg.ContextUnregVerbId; Action = '-Unregister' }
+        )) {
+            $cmdKey = Join-Path $script:Cfg.ContextRoot "$class\shell\$($pair.Verb)\command"
+            if (-not (Test-Path -LiteralPath $cmdKey)) { continue }
+            $expected = '{0} {1} "%1"' -f $launcherCmd, $pair.Action
+            $current = (Get-ItemProperty -LiteralPath $cmdKey -ErrorAction SilentlyContinue).'(default)'
+            if ($current -ne $expected) {
+                try {
+                    Set-ItemProperty -LiteralPath $cmdKey -Name '(Default)' -Value $expected
+                    Write-Log "Repointed $class\$($pair.Verb) at the current launcher."
+                } catch {
+                    Write-Log "Could not repoint ${cmdKey}: $_" -Level Warn
+                }
+            }
+        }
+    }
+
+    # The self shortcuts bake in the launcher path too.
+    try {
+        $settingsLnk = Join-Path $script:Cfg.SelfStartMenuFolder 'WinRegister Settings.lnk'
+        if (Test-Path -LiteralPath $settingsLnk) {
+            $target = Get-ShortcutTarget -Path $settingsLnk
+            if ($target -and $target -ine $script:Cfg.HiddenLauncher) { New-SelfStartMenuShortcuts }
+        }
+    } catch {
+        Write-Log "Self Start Menu shortcut refresh failed (non-fatal): $_" -Level Warn
+    }
+}
+
+function Register-SelfHealTask {
+    # Per-user scheduled task - no elevation, no admin rights. Runs the healer at
+    # logon and once a day so a program that moves while WinRegister is not being
+    # used is still followed. The action is the compiled launcher rather than
+    # powershell.exe because Task Scheduler shows a console window for the
+    # latter when it runs as the interactive user.
+    if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) {
+        Write-Log "ScheduledTasks module unavailable; skipping self-heal task." -Level Warn
+        return $false
+    }
+
+    $exe = $script:Cfg.HiddenLauncher
+    if (Test-Path -LiteralPath $exe) {
+        $action = New-ScheduledTaskAction -Execute $exe -Argument '-SelfHeal'
+    } else {
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+            -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -SelfHeal' `
+                -f $script:Cfg.InstalledScript)
+    }
+
+    try {
+        $triggers = @(
+            (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
+            (New-ScheduledTaskTrigger -Daily -At '12:00')
+        )
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable -Hidden `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
+            -MultipleInstances IgnoreNew
+        $principal = New-ScheduledTaskPrincipal -UserId ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME) `
+            -LogonType Interactive -RunLevel Limited
+
+        Register-ScheduledTask -TaskName $script:Cfg.SelfHealTaskName -TaskPath $script:Cfg.SelfHealTaskPath `
+            -Action $action -Trigger $triggers -Settings $settings -Principal $principal `
+            -Description 'Follows registered programs when they are updated, moved, or removed.' `
+            -Force | Out-Null
+        Write-Log "Registered scheduled task: $($script:Cfg.SelfHealTaskPath)$($script:Cfg.SelfHealTaskName)"
+        return $true
+    } catch {
+        Write-Log "Could not register the self-heal task (non-fatal): $_" -Level Warn
+        return $false
+    }
+}
+
+function Unregister-SelfHealTask {
+    if (-not (Get-Command Unregister-ScheduledTask -ErrorAction SilentlyContinue)) { return }
+    try {
+        $existing = Get-ScheduledTask -TaskName $script:Cfg.SelfHealTaskName `
+            -TaskPath $script:Cfg.SelfHealTaskPath -ErrorAction SilentlyContinue
+        if ($existing) {
+            Unregister-ScheduledTask -TaskName $script:Cfg.SelfHealTaskName `
+                -TaskPath $script:Cfg.SelfHealTaskPath -Confirm:$false
+            Write-Log "Removed the self-heal scheduled task."
+        }
+    } catch {
+        Write-Log "Could not remove the self-heal task: $_" -Level Warn
+    }
+}
+
+function Confirm-SelfHealTask {
+    # Registers the task only when it is genuinely absent. This is the upgrade
+    # path for an install that predates it: the task appears on the next run
+    # rather than requiring the user to reinstall.
+    param($Maintenance)
+    if (-not [bool](Get-SafeProperty $Maintenance 'ScheduledTask' -Default $true)) { return }
+    if ((Get-SelfHealTaskState) -ne 'not registered') { return }
+    try { [void](Register-SelfHealTask) } catch { Write-Log "Self-heal task provisioning failed: $_" -Level Warn }
+}
+
+function Get-SelfHealTaskState {
+    if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) { return 'unavailable' }
+    try {
+        $t = Get-ScheduledTask -TaskName $script:Cfg.SelfHealTaskName `
+            -TaskPath $script:Cfg.SelfHealTaskPath -ErrorAction SilentlyContinue
+        if (-not $t) { return 'not registered' }
+        return $t.State.ToString().ToLowerInvariant()
+    } catch { return 'unknown' }
 }
 
 function Register-SelfInArp {
@@ -2933,11 +3737,10 @@ function New-SelfStartMenuShortcuts {
         New-Item -ItemType Directory -Path $script:Cfg.SelfStartMenuFolder -Force | Out-Null
     }
 
+    # The launcher is itself the executable now, so the shortcut targets it
+    # directly and passes only the action.
     $launcher = $script:Cfg.HiddenLauncher
     if (-not (Test-Path -LiteralPath $launcher)) { return }
-
-    # The shortcut targets wscript.exe and passes our launcher + the action.
-    $wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
 
     foreach ($entry in @(
         @{ Name = 'WinRegister Settings'; Arg = '-Settings'; Aumid = 'WinRegister.Self.Settings' }
@@ -2946,8 +3749,8 @@ function New-SelfStartMenuShortcuts {
         $scPath = Join-Path $script:Cfg.SelfStartMenuFolder "$($entry.Name).lnk"
         [WinRegister.Native]::CreateShortcut(
             $scPath,
-            $wscript,
-            ('"{0}" {1}' -f $launcher, $entry.Arg),
+            $launcher,
+            $entry.Arg,
             $script:Cfg.DataFolder,
             $entry.Name,
             $script:Cfg.InstalledScript,    # icon source - PS doesn't have a great icon, fall back to imageres if PE has none
@@ -2987,7 +3790,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$($script:Cfg.Installed
     Set-Content -LiteralPath $script:Cfg.InstalledShim -Value $shim -Encoding ASCII
 
     # Hidden launcher (no console flash) - for context menu use
-    Write-HiddenLauncher
+    if (-not (Write-HiddenLauncher)) {
+        Write-Log "Continuing without a compiled launcher; context menu will use powershell.exe directly." -Level Warn
+    }
+    Remove-Item -LiteralPath $script:Cfg.LegacyVbsLauncher -Force -ErrorAction SilentlyContinue
 
     # Add install folder to user PATH if not present
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -2999,7 +3805,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$($script:Cfg.Installed
         Write-Log "Added $($script:Cfg.DataFolder) to user PATH."
     }
 
-    $launcherCmd = "wscript.exe `"$($script:Cfg.HiddenLauncher)`""
+    $launcherCmd = Get-LauncherCommand
 
     $targets = @(
         @{ Class = 'exefile'   }
@@ -3062,6 +3868,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$($script:Cfg.Installed
     # Start Menu shortcuts for the Settings UI and update check.
     try { New-SelfStartMenuShortcuts } catch { Write-Log "Self Start Menu shortcut failed (non-fatal): $_" -Level Warn }
 
+    # Background maintenance, so a program that moves while WinRegister is idle
+    # is still followed rather than silently going dead.
+    $prefs = Get-Settings
+    if ([bool](Get-SafeProperty (Get-SafeProperty $prefs 'Maintenance') 'ScheduledTask' -Default $true)) {
+        try { [void](Register-SelfHealTask) } catch { Write-Log "Self-heal task registration failed (non-fatal): $_" -Level Warn }
+    }
+
     # Restart Explorer so the classic menu + new entries take effect immediately.
     Restart-WindowsExplorer
 
@@ -3111,6 +3924,11 @@ function Uninstall-WinRegister {
     # Remove self-registration from Apps & Features + Start Menu shortcuts.
     try { Unregister-SelfFromArp }         catch { Write-Log "Remove self-ARP: $_" -Level Warn }
     try { Remove-SelfStartMenuShortcuts }  catch { Write-Log "Remove self Start Menu: $_" -Level Warn }
+    try { Unregister-SelfHealTask }        catch { Write-Log "Remove self-heal task: $_" -Level Warn }
+
+    foreach ($stale in $script:Cfg.HiddenLauncher, $script:Cfg.LauncherStamp, $script:Cfg.LegacyVbsLauncher) {
+        Remove-Item -LiteralPath $stale -Force -ErrorAction SilentlyContinue
+    }
 
     # Revert the classic menu tweak only if WE set it on install.
     $weOwnedClassic = Test-Path -LiteralPath $script:Cfg.ClassicMenuMarker
@@ -3149,6 +3967,11 @@ function Invoke-SelfTest {
     # parent locals but writes default to local scope - a hashtable is mutated
     # by reference and avoids the trap.
     $state = @{ Passed = 0; Total = 0; Errors = @() }
+
+    # No window, toast, or modal box for the duration. The suite drives the real
+    # register/unregister paths, and any of them can raise UI on failure - which
+    # would both deface the screen and block the run waiting for a click.
+    $script:SuppressDialogs = $true
 
     function Test-Step {
         param([string]$Name, [scriptblock]$Block)
@@ -3210,6 +4033,18 @@ function Invoke-SelfTest {
     # 3. Settings round-trip
     $sf = $script:Cfg.SettingsFile
     $sfBackup = if (Test-Path $sf) { Backup-File -Path $sf -Tag 'selftest' } else { $null }
+
+    # The end-to-end cases below drive the real register/unregister paths, which
+    # raise a toast when notifications are on. A verification run must not put
+    # windows on the user's screen, so they are turned off for the duration and
+    # the user's own settings are restored from $sfBackup at the end.
+    $quietPrefs = Get-DefaultSettings
+    $quietPrefs.Notifications.ShowOnRegister   = $false
+    $quietPrefs.Notifications.ShowOnUnregister = $false
+    $quietPrefs.Confirmation.AskOnRegister     = $false
+    $quietPrefs.Confirmation.AskOnUnregister   = $false
+    Save-Settings -Settings $quietPrefs
+
     Test-Step 'Settings: defaults are valid' {
         $s = Get-DefaultSettings
         ($s.Confirmation.AskOnRegister -eq $true) -and ($s.Updates.CheckEnabled -eq $true)
@@ -3217,6 +4052,10 @@ function Invoke-SelfTest {
     Test-Step 'Settings: save+load round-trips' {
         $s = Get-DefaultSettings
         $s.Confirmation.AskOnRegister = $false
+        # Written back quiet: this file is what the end-to-end cases below run
+        # against, and re-saving stock defaults here would switch toasts back on.
+        $s.Notifications.ShowOnRegister   = $false
+        $s.Notifications.ShowOnUnregister = $false
         Save-Settings -Settings $s
         (Get-Settings).Confirmation.AskOnRegister -eq $false
     }
@@ -3352,12 +4191,152 @@ function Invoke-SelfTest {
         Remove-Item -LiteralPath $scratchRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # 7. Launcher: must not depend on a script-engine file association
+    Test-Step 'Launcher: a C# compiler is available' { $null -ne (Get-CSharpCompiler) }
+    Test-Step 'Launcher: builds a GUI-subsystem executable' {
+        $probeDir = Join-Path $env:TEMP "WinRegister-LauncherTest-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+        New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+        $realExe = $script:Cfg.HiddenLauncher
+        $realStamp = $script:Cfg.LauncherStamp
+        try {
+            $script:Cfg.HiddenLauncher = Join-Path $probeDir 'probe-launcher.exe'
+            $script:Cfg.LauncherStamp  = Join-Path $probeDir 'probe.stamp'
+            if (-not (Write-HiddenLauncher)) { throw 'compile reported failure' }
+            # Subsystem 2 is IMAGE_SUBSYSTEM_WINDOWS_GUI - the whole point, since
+            # a console subsystem would flash a window on every right-click.
+            (Get-PESubsystem -Path $script:Cfg.HiddenLauncher) -eq 2
+        } finally {
+            $script:Cfg.HiddenLauncher = $realExe
+            $script:Cfg.LauncherStamp  = $realStamp
+            Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-Step 'Launcher: command never routes through a script host' {
+        $cmd = Get-LauncherCommand
+        ($cmd -notmatch 'wscript') -and ($cmd -notmatch 'cscript') -and ($cmd -notmatch '\.vbs')
+    }
+
+    # 8. Self-heal matching. These decide whether a registration is rewritten or
+    #    deleted, so they are asserted on constructed entries rather than by
+    #    moving anything on the user's disk.
+    Test-Step 'Match: same filename is enough to follow a move' {
+        $e = [pscustomobject]@{ ExePath = 'D:\Old\SelfTestApp.exe'; DisplayName = 'Whatever'; Vendor = '' }
+        (Get-ProgramMatchScore -Entry $e -CandidatePath $tempExe) -ge 3
+    }
+    Test-Step 'Match: a different publisher vetoes a filename match' {
+        $realVendor = (Get-ExeIdentity -Path $tempExe).Company
+        if (-not $realVendor) { return $true }   # unsigned probe binary; veto is untestable
+        $e = [pscustomobject]@{
+            ExePath = 'D:\Old\SelfTestApp.exe'; DisplayName = 'Whatever'
+            Vendor  = 'A Completely Different Publisher Ltd' }
+        (Get-ProgramMatchScore -Entry $e -CandidatePath $tempExe) -lt 3
+    }
+    Test-Step 'Match: an unreadable candidate scores zero' {
+        $e = [pscustomobject]@{ ExePath = 'D:\Old\app.exe'; DisplayName = 'X'; Vendor = '' }
+        (Get-ProgramMatchScore -Entry $e -CandidatePath 'D:\Nope\does-not-exist.exe') -eq 0
+    }
+    Test-Step 'Search roots: never a drive root or a shell folder' {
+        (-not (Test-IsSearchableRoot -Path 'D:\')) -and
+        (-not (Test-IsSearchableRoot -Path $env:USERPROFILE)) -and
+        (-not (Test-IsSearchableRoot -Path $env:ProgramFiles)) -and
+        (Test-IsSearchableRoot -Path 'D:\Tools\PortableApps')
+    }
+    Test-Step 'Search roots: the ancestor walk is bounded' {
+        $e = [pscustomobject]@{ ExePath = "$tempDir\a\b\c\d\e\f\app.exe" }
+        @(Get-RelocationSearchRoot -Entry $e).Count -le ($script:Cfg.RelocateMaxAncestors + 2)
+    }
+    Test-Step 'Relocate: finds the program after its folder is renamed' {
+        $movedRoot = Join-Path $env:TEMP "WinRegister-Move-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+        $v1 = Join-Path $movedRoot 'App-1.0'
+        $v2 = Join-Path $movedRoot 'App-2.0'
+        New-Item -ItemType Directory -Path $v2 -Force | Out-Null
+        try {
+            Copy-Item -LiteralPath $tempExe -Destination (Join-Path $v2 'SelfTestApp.exe')
+            $e = [pscustomobject]@{
+                ExePath     = (Join-Path $v1 'SelfTestApp.exe')
+                DisplayName = 'SelfTest App'
+                Vendor      = (Get-ExeIdentity -Path $tempExe).Company
+            }
+            (Find-RelocatedExecutable -Entry $e) -ieq (Join-Path $v2 'SelfTestApp.exe')
+        } finally {
+            Remove-Item -LiteralPath $movedRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-Step 'Relocate: climbs past a whole branch that was renamed at once' {
+        # The shape that occurs in practice: the exe lived several folders deep
+        # and every one of those folders was replaced by a single new one.
+        $movedRoot = Join-Path $env:TEMP "WinRegister-Deep-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+        $newHome = Join-Path $movedRoot 'App Revamped'
+        New-Item -ItemType Directory -Path $newHome -Force | Out-Null
+        try {
+            Copy-Item -LiteralPath $tempExe -Destination (Join-Path $newHome 'SelfTestApp.exe')
+            $e = [pscustomobject]@{
+                ExePath     = (Join-Path $movedRoot 'Old App\Reskins\2. Dark [Theme]\3. Purple\SelfTestApp.exe')
+                DisplayName = 'SelfTest App'; Vendor = '' }
+            (Find-RelocatedExecutable -Entry $e) -ieq (Join-Path $newHome 'SelfTestApp.exe')
+        } finally {
+            Remove-Item -LiteralPath $movedRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-Step 'Relocate: never steals an exe another registration owns' {
+        $movedRoot = Join-Path $env:TEMP "WinRegister-Claim-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+        $newHome = Join-Path $movedRoot 'Only Copy'
+        New-Item -ItemType Directory -Path $newHome -Force | Out-Null
+        try {
+            $only = Join-Path $newHome 'SelfTestApp.exe'
+            Copy-Item -LiteralPath $tempExe -Destination $only
+            $e = [pscustomobject]@{
+                ExePath     = (Join-Path $movedRoot 'Gone\SelfTestApp.exe')
+                DisplayName = 'SelfTest App'; Vendor = '' }
+            # Unclaimed it is found; claimed by someone else it must be refused.
+            ((Find-RelocatedExecutable -Entry $e) -ieq $only) -and
+            ($null -eq (Find-RelocatedExecutable -Entry $e -ClaimedPaths @($only)))
+        } finally {
+            Remove-Item -LiteralPath $movedRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-Step 'Relocate: returns nothing when the program is really gone' {
+        $goneRoot = Join-Path $env:TEMP "WinRegister-Gone-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+        New-Item -ItemType Directory -Path $goneRoot -Force | Out-Null
+        try {
+            $e = [pscustomobject]@{
+                ExePath     = (Join-Path $goneRoot 'sub\VanishedApp.exe')
+                DisplayName = 'Vanished App'; Vendor = '' }
+            $null -eq (Find-RelocatedExecutable -Entry $e)
+        } finally {
+            Remove-Item -LiteralPath $goneRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-Step 'Self-heal: an empty store is a no-op, not an error' {
+        $s = & { function Get-RegistrationStore { [ordered]@{} }
+                 function Update-ContextMenuConditions { }
+                 Invoke-SelfHeal -Quiet }
+        ($s.Pruned -eq 0) -and ($s.Relocated -eq 0)
+    }
+    Test-Step 'ARP: an install larger than 2GB does not overflow' {
+        $bigId = 'WinRegister.SelfTestBigApp.deadbeef01'
+        try {
+            Set-UninstallEntry -AppId $bigId -DisplayName 'SelfTest Big' -ExePath $tempExe `
+                -Vendor 'T' -Version '1.0' -InstallSize 23190944677
+            $kb = (Get-ItemProperty -LiteralPath (Join-Path $script:Cfg.UninstallRoot $bigId)).EstimatedSize
+            $kb -eq [int](23190944677 / 1KB)
+        } finally {
+            Remove-UninstallEntry -AppId $bigId
+        }
+    }
+    Test-Step 'Settings: maintenance knobs default to on' {
+        $m = (Get-DefaultSettings).Maintenance
+        $m.AutoHeal -and $m.AutoRelocate -and $m.AutoPrune -and $m.ScheduledTask
+    }
+
     # Cleanup
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     if ($sfBackup -and (Test-Path $sfBackup)) {
         Copy-Item -LiteralPath $sfBackup -Destination $sf -Force
         Remove-Item -LiteralPath $sfBackup -Force -ErrorAction SilentlyContinue
     }
+
+    $script:SuppressDialogs = $false
 
     Write-Host ""
     Write-Host ("Result: {0} passed, {1} failed" -f $state.Passed, $state.Errors.Count) -ForegroundColor $(if ($state.Errors.Count -eq 0){'Green'}else{'Red'})
@@ -3377,7 +4356,8 @@ function Show-Help {
     Write-Host "  .\WinRegister.ps1 -List                     Show all WinRegister registrations" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -Settings                 Open the settings dialog" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -CheckUpdate              Check for a newer release now" -ForegroundColor Gray
-    Write-Host "  .\WinRegister.ps1 -Repair                   Heal dead entries / rebuild missing shortcuts" -ForegroundColor Gray
+    Write-Host "  .\WinRegister.ps1 -Repair                   Follow moved programs, rebuild artefacts, drop dead entries" -ForegroundColor Gray
+    Write-Host "  .\WinRegister.ps1 -SelfHeal                 The same pass, silent (runs automatically)" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -Doctor                   Diagnostic snapshot of install + registrations" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -SelfTest                 Run internal verification suite" -ForegroundColor Gray
     Write-Host "  .\WinRegister.ps1 -Version                  Print version and exit" -ForegroundColor Gray
@@ -3387,6 +4367,11 @@ function Show-Help {
     Write-Host "After installing, right-click any program file or its folder and choose" -ForegroundColor Gray
     Write-Host "'Register with Windows'. On Windows 11 this lives under 'Show more options'" -ForegroundColor Gray
     Write-Host "(or use Shift+Right-click)." -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "Registrations maintain themselves: a program that is updated into a new" -ForegroundColor Gray
+    Write-Host "folder, moved, or reinstalled elsewhere is found again and its Start Menu," -ForegroundColor Gray
+    Write-Host "Run-dialog and Apps & Features entries are rewritten to match. Turn any of" -ForegroundColor Gray
+    Write-Host "that off under 'Maintenance' in %APPDATA%\WinRegister\settings.json." -ForegroundColor Gray
     Write-Host ""
 }
 
@@ -3402,6 +4387,14 @@ try {
 }
 
 try {
+    # Every action except the ones that build or tear down the install runs the
+    # healer first. That is what makes "the app moved" a non-event: by the time
+    # the menu, the list, or a registration is evaluated, the store already
+    # describes where the programs actually are.
+    if ($PSCmdlet.ParameterSetName -in 'Register', 'Unregister', 'List', 'Doctor', 'Settings') {
+        Invoke-AutoHeal
+    }
+
     switch ($PSCmdlet.ParameterSetName) {
         'Register' {
             Invoke-StartupUpdateCheck
@@ -3415,6 +4408,11 @@ try {
         'Uninstall'  { Uninstall-WinRegister }
         'List'       { Show-RegistrationList }
         'Repair'     { Invoke-Repair }
+        'SelfHeal'   {
+            Repair-LauncherWiring
+            Confirm-SelfHealTask -Maintenance (Get-SafeProperty (Get-Settings) 'Maintenance')
+            [void](Invoke-SelfHeal -Quiet)
+        }
         'Doctor'     { Invoke-Doctor }
         'Settings'   { Show-SettingsDialog }
         'Version'    { Write-Host $script:Cfg.Version }

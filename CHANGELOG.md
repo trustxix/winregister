@@ -4,6 +4,69 @@ All notable changes to WinRegister are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-09-08
+
+### Fixed
+- **The right-click entries raised "There is no script engine for file extension
+  `.vbs`" and did nothing.** The context menu invoked a VBScript trampoline
+  through `wscript.exe`, which resolves the script engine by looking up the
+  `.vbs` file association. Notepad++ repoints `HKCU\Software\Classes\.vbs` at
+  its own `Notepad++_file` ProgID, which has no `ScriptEngine` subkey — and
+  because `HKCU` shadows `HKLM` in the `HKCR` merge, that per-user association
+  breaks `.vbs` execution machine-wide. Any program that claims the extension
+  causes this.
+
+  The trampoline is now a compiled GUI-subsystem executable
+  (`winregister-launcher.exe`, built at install time with the in-box .NET
+  Framework compiler). A real PE is launched directly by the shell with no
+  file-association lookup anywhere in the path, so no other program can break
+  it. It also removes the dependency on VBScript, which Microsoft has
+  deprecated and scheduled for removal. Existing installs repair themselves on
+  their next run — the launcher is rebuilt, the `.vbs` deleted, and all six
+  verb commands repointed, with no reinstall.
+- **An install folder larger than 2 GB silently lost its Apps & Features
+  entry.** `[Math]::Max(0, $InstallSize)` bound the `Max(int, int)` overload
+  because the literal `0` is an `Int32`, so the size calculation threw for any
+  program over that size and the ARP write was abandoned. Surfaced by a 23 GB
+  game-server directory.
+- `-SelfTest` no longer draws on the screen. It disables notifications for the
+  duration and suppresses modal dialogs, which previously could both deface the
+  screen and block the run waiting for a click.
+
+### Added
+- **Registrations now maintain themselves.** A registration is a set of
+  pointers at one absolute path, so anything that moves the program breaks all
+  of them at once — and portable apps move constantly, with updaters unpacking
+  into versioned sibling folders and users reorganising tool drives. Instead of
+  deleting a registration whose target has vanished, WinRegister now looks for
+  the program and rewrites the pointers to wherever it went, keeping the Start
+  Menu entry, the Run-dialog name and the Apps & Features record intact. Only a
+  program that cannot be found at all is dropped.
+
+  The search climbs from the dead path to the nearest directory that still
+  exists, then scans downward. Matching weighs the executable's filename,
+  product name and publisher, and treats a publisher that positively disagrees
+  as proof of a different program; an executable another registration already
+  owns is never taken. The walk stops at the first ancestor too broad to
+  search, so it never reaches a drive root or a shell folder.
+- **The pass runs automatically** before every action, and from a per-user
+  scheduled task at logon and once a day, so a program that moves while
+  WinRegister is idle is still followed. No admin rights, no elevation.
+- **`-SelfHeal`** runs the pass silently; `-Repair` runs the same pass with its
+  output shown, replacing its previous, weaker implementation.
+- Artefact drift is repaired too: a deleted Start Menu shortcut, an App Paths
+  key pointing at the wrong target, a missing ARP record, or a version string
+  left behind by an in-place update.
+- **`Maintenance` settings group** (`AutoHeal`, `AutoRelocate`, `AutoPrune`,
+  `ScheduledTask`), all on by default. Each stage can be turned off
+  independently in `settings.json`, since the healer rewrites and deletes
+  registrations without asking.
+- `-Doctor` reports launcher kind, the maintenance switches, scheduled task
+  state, and how many registrations have been followed to a new location.
+- Fifteen self-test cases covering the launcher build and its subsystem, match
+  scoring, search-root bounding, relocation across a renamed branch, the
+  claimed-executable guard, and the 2 GB ARP overflow.
+
 ## [1.4.0] - 2026-08-18
 
 ### Changed

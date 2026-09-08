@@ -64,6 +64,30 @@ Every registration writes four things (all per-user, all reversible):
 | Tracking record in `%LOCALAPPDATA%\WinRegister\registrations.json` | So unregister/repair work cleanly |
 | `AppliesTo` condition on both context-menu verbs | So each item shows only the entry that applies to it |
 
+## Registrations look after themselves
+
+A registration is a set of pointers at one absolute path, so anything that moves
+the program breaks all of them at once — and portable apps move constantly.
+An updater unpacks into a versioned sibling folder, a tools drive gets
+reorganised, a reinstall lands somewhere else, and the Start Menu entry silently
+stops working.
+
+WinRegister handles that without being asked. Before every action, and from a
+per-user scheduled task at logon and once a day, it checks each registration and:
+
+- **follows a program that moved** — finds it near where it used to be and
+  rewrites the shortcut, the `Win+R` name and the Apps & Features record to match;
+- **repairs drift** — a deleted Start Menu shortcut, an App Paths key pointing
+  somewhere else, a missing uninstall record, or a version string left behind by
+  an in-place update;
+- **drops an entry only once the program cannot be found at all.**
+
+The search climbs from the dead path to the nearest folder that still exists and
+scans down from there. It weighs filename, product name and publisher, refuses an
+executable another registration already owns, and stops at the first ancestor too
+broad to search, so it never scans a whole drive. Every stage has an off switch
+under `Maintenance` in `settings.json`.
+
 Implementation references the Microsoft Win32 specifications directly — see
 the inline comments in `WinRegister.ps1` for citations against the
 [PE Format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format),
@@ -81,7 +105,8 @@ winregister -Unregister <path>     Remove a previous registration
 winregister -List                  Show all registered programs
 winregister -Settings              Open the Settings dialog
 winregister -CheckUpdate           Check for a newer release now
-winregister -Repair                Heal dead entries / rebuild missing shortcuts
+winregister -Repair                Follow moved programs, rebuild artefacts, drop dead entries
+winregister -SelfHeal              The same pass, silent (runs automatically)
 winregister -Doctor                Diagnostic snapshot
 winregister -Uninstall             Remove the right-click menu entries
 winregister -Uninstall -Purge      Also remove every registration
@@ -106,6 +131,8 @@ Defaults:
 - Show success toast after register/unregister
 - Check for updates daily (toggle off to disable entirely)
 - Auto-detect primary executable when registering a folder
+- `Maintenance.AutoHeal` / `AutoRelocate` / `AutoPrune` / `ScheduledTask` — the
+  self-maintenance stages described above, all on
 
 ## Updates
 
