@@ -3632,6 +3632,11 @@ function Repair-LauncherWiring {
     # with a context menu that raises "There is no script engine for file
     # extension .vbs" every time they click it.
     if (-not (Test-Path -LiteralPath $script:Cfg.InstalledScript)) { return }
+    # A plain -Uninstall leaves the script in place, so the script's existence is
+    # not evidence that the install is still wanted. Without this the healer
+    # would rebuild the launcher after an uninstall - not enough to bring the
+    # menu back, but enough that the uninstall did not fully take.
+    if (-not (Test-InstallPresent)) { return }
 
     $want = Get-LauncherStampValue -Mode 'exe'
     $have = $null
@@ -4585,10 +4590,27 @@ function Invoke-SelfTest {
             -not (Test-InstallPresent)
         }
         Test-Step 'Uninstall stays uninstalled: the healer rebuilds nothing' {
-            # The regression this guards: a footprint healer that recreates verb
-            # keys unconditionally would put the context menu back on the next
-            # -List or scheduled run, so an uninstall would never stick.
-            @(Repair-InstallFootprint -Quiet).Count -eq 0
+            # The regression this guards: a healer that recreates what is missing
+            # would put the context menu back on the next -List or scheduled run,
+            # so an uninstall would never stick. Both healers are checked - a
+            # plain -Uninstall leaves the script on disk, so the script's
+            # existence must not count as consent to rebuild.
+            if (@(Repair-InstallFootprint -Quiet).Count -ne 0) { return $false }
+            $realExe = $script:Cfg.HiddenLauncher
+            $realStamp = $script:Cfg.LauncherStamp
+            $realScript = $script:Cfg.InstalledScript
+            try {
+                $script:Cfg.HiddenLauncher   = Join-Path $fpDir 'should-not-appear.exe'
+                $script:Cfg.LauncherStamp    = Join-Path $fpDir 'should-not-appear.stamp'
+                $script:Cfg.InstalledScript  = Join-Path $fpDir 'WinRegister.ps1'
+                Set-Content -LiteralPath $script:Cfg.InstalledScript -Value '# stand-in' -Encoding ASCII
+                Repair-LauncherWiring
+                -not (Test-Path -LiteralPath $script:Cfg.HiddenLauncher)
+            } finally {
+                $script:Cfg.HiddenLauncher  = $realExe
+                $script:Cfg.LauncherStamp   = $realStamp
+                $script:Cfg.InstalledScript = $realScript
+            }
         }
         Test-Step 'Install state: an existing verb is adopted as an install' {
             New-Item -Path (Join-Path $script:Cfg.ContextRoot "exefile\shell\$($script:Cfg.ContextVerbId)") -Force | Out-Null
