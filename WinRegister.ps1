@@ -936,6 +936,24 @@ namespace WinRegister
             SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSH, IntPtr.Zero, IntPtr.Zero);
         }
 
+        // Expand an 8.3 short path to the name the filesystem actually holds.
+        // Nothing in .NET does this - GetFullPath, Resolve-Path, FileSystemInfo
+        // and Scripting.FileSystemObject all hand a short path straight back.
+        // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getlongpathnamew
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetLongPathNameW(string lpszShortPath, StringBuilder lpszLongPath, uint cchBuffer);
+
+        public static string ExpandShortPath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) { return path; }
+            var sb = new StringBuilder(4096);
+            uint n = GetLongPathNameW(path, sb, (uint)sb.Capacity);
+            // 0 means it could not be resolved - a path that does not exist yet,
+            // for one. Returning the input unchanged is the honest answer.
+            if (n == 0 || n > sb.Capacity) { return path; }
+            return sb.ToString();
+        }
+
         // Force a window to the foreground despite Windows' background-app
         // foreground lockout. The trick: attach our input thread to the
         // currently-foreground window's thread, which transfers foreground
@@ -4396,7 +4414,8 @@ function Invoke-SelfTest {
     # rather than teach each case to tolerate both spellings.
     $testTemp = $env:TEMP
     try {
-        $testTemp = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($env:TEMP).Path
+        Initialize-Native
+        $testTemp = [WinRegister.Native]::ExpandShortPath($env:TEMP)
     } catch {
         Write-Log "Could not expand TEMP for the self-test, using it as-is: $_" -Level Warn
     }
