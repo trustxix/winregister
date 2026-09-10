@@ -126,6 +126,100 @@ jobs:
           Write-Host "Produced:"
           Get-ChildItem installer\output
 
+      - name: Smoke test the installer (install, verify, uninstall)
+        shell: pwsh
+        run: |
+          # The installer is the one path that cannot be exercised on a
+          # developer machine: it restarts Explorer and rewrites the user's
+          # shell. A throwaway runner is the only place that is free, so the
+          # whole install -> assert -> uninstall cycle runs here, before the
+          # release step, and blocks the release if any of it regresses.
+          $ErrorActionPreference = 'Stop'
+          $v = '${{ steps.ver.outputs.version }}'
+          $setup = "installer\output\WinRegister-Setup-$v.exe"
+          $script:failures = @()
+          function Assert($ok, $msg) {
+            if ($ok) { Write-Host "  [OK]   $msg" }
+            else     { Write-Host "  [FAIL] $msg"; $script:failures += $msg }
+          }
+
+          Write-Host "== Installing =="
+          $p = Start-Process -FilePath $setup -Wait -PassThru `
+                 -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=inno-install.log'
+          if ($p.ExitCode -ne 0) {
+            Get-Content inno-install.log -Tail 40
+            throw "Installer exited $($p.ExitCode)"
+          }
+
+          $app     = Join-Path $env:LOCALAPPDATA 'WinRegister'
+          $script  = Join-Path $app 'WinRegister.ps1'
+          $classes = 'exefile','lnkfile','Directory'
+          $verbs   = 'WinRegister.Register','WinRegister.Unregister'
+
+          Write-Host "== Verifying the install footprint =="
+          Assert (Test-Path $script) 'script deployed to %LOCALAPPDATA%\WinRegister'
+          Assert (Test-Path (Join-Path $app 'winregister-launcher.exe')) 'launcher compiled at install time'
+          Assert (Test-Path (Join-Path $app '.installed')) 'install marker written'
+          foreach ($c in $classes) {
+            foreach ($verb in $verbs) {
+              Assert (Test-Path "HKCU:\Software\Classes\$c\shell\$verb") "verb key $c\$verb"
+            }
+          }
+
+          # The verb must invoke a binary. A command that resolves through a file
+          # association is owned by whoever claimed that extension - the failure
+          # that killed the .vbs trampoline machine-wide.
+          $cmd = (Get-ItemProperty "HKCU:\Software\Classes\exefile\shell\$($verbs[0])\command").'(default)'
+          Assert ($cmd -like '*winregister-launcher.exe*') "Register verb runs the compiled launcher: $cmd"
+
+          # -SkipSelfArp is the installer's own path and exists so WinRegister
+          # never writes a second Apps & Features row beside Inno's. Nothing on a
+          # developer machine exercises it.
+          $owner = Join-Path $app '.self-arp-owner'
+          Assert (Test-Path $owner) '.self-arp-owner marker written'
+          if (Test-Path $owner) {
+            Assert ((Get-Content $owner -Raw).Trim() -eq 'external') 'ARP row recorded as external, not owned'
+          }
+          $arpRoot = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+          Assert (-not (Test-Path "$arpRoot\WinRegister.Self")) 'no duplicate self ARP row beside the installer''s'
+          Assert (Test-Path "$arpRoot\{E8E7A3B4-9C1D-4F5E-A8B2-D1E3F5A7C9D2}_is1") "Inno's own ARP row present"
+
+          Write-Host "== Self-test, against the installed copy, under Windows PowerShell 5.1 =="
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script -SelfTest
+          Assert ($LASTEXITCODE -eq 0) "self-test passes on a clean machine (exit $LASTEXITCODE)"
+
+          $log = Join-Path $app 'winregister.log'
+          if (Test-Path $log) { Write-Host "== install log =="; Get-Content $log -Tail 30 }
+
+          Write-Host "== Uninstalling =="
+          $unins = Join-Path $app 'unins000.exe'
+          Assert (Test-Path $unins) 'uninstaller present'
+          if (Test-Path $unins) {
+            Start-Process -FilePath $unins -Wait `
+              -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+            # Inno respawns itself out of %TEMP% to delete its own exe, so the
+            # -Wait above returns while the real work is still running.
+            $deadline = (Get-Date).AddMinutes(3)
+            while ((Get-Process -Name '_iu*' -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 2
+            }
+            Start-Sleep -Seconds 3
+          }
+
+          Write-Host "== Verifying the uninstall =="
+          foreach ($c in $classes) {
+            foreach ($verb in $verbs) {
+              Assert (-not (Test-Path "HKCU:\Software\Classes\$c\shell\$verb")) "verb key $c\$verb removed"
+            }
+          }
+          Assert (-not (Test-Path $app)) 'install folder removed'
+
+          if ($script:failures.Count -gt 0) {
+            $script:failures | ForEach-Object { Write-Host "::error::installer smoke test: $_" }
+            exit 1
+          }
+          Write-Host "Installer smoke test passed."
+
       - name: Build source ZIP fallback
         shell: pwsh
         run: |
