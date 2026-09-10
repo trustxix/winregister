@@ -4388,6 +4388,19 @@ function Invoke-SelfTest {
     # would both deface the screen and block the run waiting for a click.
     $script:SuppressDialogs = $true
 
+    # Fixtures are built under TEMP and then compared against what the product
+    # stored. Those only agree if TEMP is already in its long form, and on a
+    # GitHub-hosted runner it is not - it arrives as C:\Users\RUNNER~1\... while
+    # everything the product records is the expanded name. Four cases failed
+    # there and nowhere else for exactly that reason, so expand it once here
+    # rather than teach each case to tolerate both spellings.
+    $testTemp = $env:TEMP
+    try {
+        $testTemp = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($env:TEMP).Path
+    } catch {
+        Write-Log "Could not expand TEMP for the self-test, using it as-is: $_" -Level Warn
+    }
+
     function Test-Step {
         param([string]$Name, [scriptblock]$Block)
         $state.Total++
@@ -4483,7 +4496,7 @@ function Invoke-SelfTest {
     Test-Step 'Blacklist honors ExtraPatterns'  { Test-IsBlacklisted -ExeBaseName 'badtool' -ExtraPatterns @('badtool') }
 
     # 5. End-to-end register + unregister with a real binary
-    $tempDir = Join-Path $env:TEMP "WinRegister-SelfTest-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+    $tempDir = Join-Path $testTemp "WinRegister-SelfTest-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
     $tempExe = Join-Path $tempDir 'SelfTestApp.exe'
     if ($guiExe) { Copy-Item -LiteralPath $guiExe -Destination $tempExe }
@@ -4622,7 +4635,7 @@ function Invoke-SelfTest {
     #     run has no business editing that - so the pieces are asserted
     #     individually instead, which is also where the contracts actually live.
     $fpRoot = 'HKCU:\Software\__WinRegisterFootprintTest'
-    $fpDir  = Join-Path $env:TEMP "WinRegister-FP-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+    $fpDir  = Join-Path $testTemp "WinRegister-FP-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
     $saved = @{
         ContextRoot   = $script:Cfg.ContextRoot
         UninstallRoot = $script:Cfg.UninstallRoot
@@ -4763,7 +4776,7 @@ function Invoke-SelfTest {
     # 7. Launcher: must not depend on a script-engine file association
     Test-Step 'Launcher: a C# compiler is available' { $null -ne (Get-CSharpCompiler) }
     Test-Step 'Launcher: builds a GUI-subsystem executable' {
-        $probeDir = Join-Path $env:TEMP "WinRegister-LauncherTest-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+        $probeDir = Join-Path $testTemp "WinRegister-LauncherTest-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
         New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
         $realExe = $script:Cfg.HiddenLauncher
         $realStamp = $script:Cfg.LauncherStamp
@@ -4815,7 +4828,7 @@ function Invoke-SelfTest {
         @(Get-RelocationSearchRoot -Entry $e).Count -le ($script:Cfg.RelocateMaxAncestors + 2)
     }
     Test-Step 'Relocate: finds the program after its folder is renamed' {
-        $movedRoot = Join-Path $env:TEMP "WinRegister-Move-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+        $movedRoot = Join-Path $testTemp "WinRegister-Move-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
         $v1 = Join-Path $movedRoot 'App-1.0'
         $v2 = Join-Path $movedRoot 'App-2.0'
         New-Item -ItemType Directory -Path $v2 -Force | Out-Null
@@ -4837,7 +4850,7 @@ function Invoke-SelfTest {
     Test-Step 'Relocate: climbs past a whole branch that was renamed at once' {
         # The shape that occurs in practice: the exe lived several folders deep
         # and every one of those folders was replaced by a single new one.
-        $movedRoot = Join-Path $env:TEMP "WinRegister-Deep-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+        $movedRoot = Join-Path $testTemp "WinRegister-Deep-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
         $newHome = Join-Path $movedRoot 'App Revamped'
         New-Item -ItemType Directory -Path $newHome -Force | Out-Null
         try {
@@ -4851,7 +4864,7 @@ function Invoke-SelfTest {
         }
     }
     Test-Step 'Relocate: never steals an exe another registration owns' {
-        $movedRoot = Join-Path $env:TEMP "WinRegister-Claim-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+        $movedRoot = Join-Path $testTemp "WinRegister-Claim-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
         $newHome = Join-Path $movedRoot 'Only Copy'
         New-Item -ItemType Directory -Path $newHome -Force | Out-Null
         try {
@@ -4868,7 +4881,7 @@ function Invoke-SelfTest {
         }
     }
     Test-Step 'Relocate: returns nothing when the program is really gone' {
-        $goneRoot = Join-Path $env:TEMP "WinRegister-Gone-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
+        $goneRoot = Join-Path $testTemp "WinRegister-Gone-$([Guid]::NewGuid().ToString('N').Substring(0,6))"
         New-Item -ItemType Directory -Path $goneRoot -Force | Out-Null
         try {
             $e = [pscustomobject]@{
