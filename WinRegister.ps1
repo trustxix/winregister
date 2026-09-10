@@ -166,7 +166,7 @@ $ErrorActionPreference = 'Stop'
 #region Configuration ----------------------------------------------------------
 
 $script:Cfg = [pscustomobject]@{
-    Version              = '1.6.1'
+    Version              = '1.6.2'
     SchemaVersion        = 2
     SettingsSchemaVersion= 2
     AppName              = 'WinRegister'
@@ -647,6 +647,9 @@ function Show-UpdateNotification {
         [pscustomobject]$Settings
     )
     if (-not $Update) { return }
+    # Reachable from the startup check, which can run from a non-interactive
+    # context; the notification is discardable, so drop it rather than block.
+    if (-not (Test-CanShowUi)) { Write-Log "Update notification suppressed: $($Update.Version) available"; return }
 
     Initialize-DpiAwareness
     Add-Type -AssemblyName System.Windows.Forms
@@ -2481,7 +2484,7 @@ function Show-ToastMessage {
         [ValidateSet('Info', 'Warning', 'Error')] [string]$Level = 'Info'
     )
     if ($Silent -and $Level -eq 'Info') { return }
-    if ($script:SuppressDialogs) { Write-Log "Toast suppressed: $Title - $Message"; return }
+    if (-not (Test-CanShowUi)) { Write-Log "Toast suppressed: $Title - $Message"; return }
 
     Initialize-DpiAwareness
     Add-Type -AssemblyName System.Windows.Forms
@@ -2529,14 +2532,23 @@ function Show-ToastMessage {
     $form.Dispose()
 }
 
+function Test-CanShowUi {
+    # A modal box blocks its caller until someone clicks it, so it must never be
+    # raised where nobody can. Two such places exist and both are unattended:
+    # the self-heal scheduled task, which runs in session 0 with no desktop, and
+    # the installer's [Run] step, which Inno waits on. A ShowDialog() there hangs
+    # forever - and because the task is registered to not start a second
+    # instance, one hung run silently ends all future maintenance.
+    # https://learn.microsoft.com/en-us/dotnet/api/system.environment.userinteractive
+    if ($script:SuppressDialogs) { return $false }
+    try { return [Environment]::UserInteractive } catch { return $false }
+}
+
 function Show-ErrorDialog {
     param([string]$Message)
-    # A modal box blocks its caller until someone clicks it. That is correct for
-    # a context-menu invocation and unacceptable for the verification suite,
-    # which must run to completion unattended and without drawing on the screen.
-    if ($script:SuppressDialogs) {
+    if (-not (Test-CanShowUi)) {
         Write-Host "  [dialog suppressed] $Message" -ForegroundColor DarkYellow
-        Write-Log "Dialog suppressed: $Message" -Level Warn
+        Write-Log "Dialog suppressed (no interactive desktop): $Message" -Level Warn
         return
     }
     Initialize-DpiAwareness
@@ -2548,7 +2560,8 @@ function Show-ErrorDialog {
 
 function Show-ConfirmYesNo {
     param([string]$Title, [string]$Message)
-    if ($script:SuppressDialogs) { Write-Log "Confirm suppressed (declined): $Title"; return $false }
+    # Declining is the safe answer when there is nobody to ask.
+    if (-not (Test-CanShowUi)) { Write-Log "Confirm suppressed (declined): $Title"; return $false }
     Initialize-DpiAwareness
     Add-Type -AssemblyName System.Windows.Forms
     $result = [System.Windows.Forms.MessageBox]::Show(
@@ -4886,6 +4899,30 @@ function Invoke-SelfTest {
     }
     Test-Step 'SemVer: 1.10.0 outranks 1.9.0 (not a string compare)' {
         (Compare-SemVer -A '1.10.0' -B '1.9.0') -gt 0
+    }
+
+    # 10. Unattended safety. Every one of these would hang forever rather than
+    # fail if it regressed, which is why they are asserted rather than trusted:
+    # the scheduled task and the installer's [Run] step both wait on a process
+    # that has no desktop to draw a modal on.
+    Test-Step 'UI guard: no dialog while the suite suppresses them' { (Test-CanShowUi) -eq $false }
+    Test-Step 'UI guard: tracks UserInteractive when not suppressed' {
+        $prev = $script:SuppressDialogs
+        try {
+            $script:SuppressDialogs = $false
+            (Test-CanShowUi) -eq [Environment]::UserInteractive
+        } finally { $script:SuppressDialogs = $prev }
+    }
+    Test-Step 'UI guard: Show-ErrorDialog returns instead of blocking' {
+        Show-ErrorDialog 'self-test: this must not open a window'
+        $true
+    }
+    Test-Step 'UI guard: Show-ConfirmYesNo declines instead of blocking' {
+        (Show-ConfirmYesNo -Title 'self-test' -Message 'must not open a window') -eq $false
+    }
+    Test-Step 'UI guard: Show-ToastMessage returns instead of blocking' {
+        Show-ToastMessage -Title 'self-test' -Message 'must not open a window' -Level Error
+        $true
     }
 
     # Cleanup

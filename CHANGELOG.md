@@ -4,6 +4,28 @@ All notable changes to WinRegister are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.6.2] - 2026-09-10
+
+### Fixed
+- **A failure in an unattended run would hang forever instead of failing.** The
+  top-level error handler raises a modal message box, and a modal blocks its
+  caller until someone clicks it. Two callers have nobody to: the self-heal
+  scheduled task, which runs with no interactive desktop, and the installer's
+  `[Run]` step, which Inno Setup waits on. In the first case the consequence is
+  worse than the hang — the task is registered not to start a second instance,
+  so one stuck run silently ends all future maintenance while leaving a
+  `powershell.exe` alive indefinitely. Every dialog now checks for an
+  interactive desktop first and logs instead, so an unattended failure fails.
+
+### Added
+- The build installs the installer, verifies the footprint it produced, runs the
+  self-test against the installed copy under Windows PowerShell 5.1, then
+  uninstalls and verifies the teardown — on a clean runner, before the release
+  is published. The installer restarts Explorer and rewrites the shell, so it
+  could never be exercised on a development machine; until now the only evidence
+  any release worked was that it compiled.
+- Self-test cases for the dialog guards and the update checker. 66 → 71.
+
 ## [1.6.1] - 2026-09-10
 
 ### Fixed

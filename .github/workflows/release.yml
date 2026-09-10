@@ -128,6 +128,7 @@ jobs:
 
       - name: Smoke test the installer (install, verify, uninstall)
         shell: pwsh
+        timeout-minutes: 15
         run: |
           # The installer is the one path that cannot be exercised on a
           # developer machine: it restarts Explorer and rewrites the user's
@@ -143,11 +144,24 @@ jobs:
             else     { Write-Host "  [FAIL] $msg"; $script:failures += $msg }
           }
 
+          # Bounded, never -Wait. Inno's [Run] step waits on WinRegister, so
+          # anything that blocks in there blocks setup, and an unbounded wait
+          # turns a diagnosable failure into a six-hour job timeout.
           Write-Host "== Installing =="
-          $p = Start-Process -FilePath $setup -Wait -PassThru `
+          $p = Start-Process -FilePath $setup -PassThru `
                  -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=inno-install.log'
+          if (-not $p.WaitForExit(300000)) {
+            Write-Host "::error::Installer still running after 5 minutes - dumping state"
+            if (Test-Path inno-install.log) { Get-Content inno-install.log -Tail 60 }
+            $wrLog = Join-Path $env:LOCALAPPDATA 'WinRegister\winregister.log'
+            if (Test-Path $wrLog) { Write-Host "-- winregister.log --"; Get-Content $wrLog -Tail 40 }
+            Get-Process | Where-Object { $_.Name -match 'powershell|WinRegister|unins|setup' } |
+              Format-Table Name,Id,StartTime -AutoSize | Out-String | Write-Host
+            $p | Stop-Process -Force -ErrorAction SilentlyContinue
+            throw "Installer hung"
+          }
           if ($p.ExitCode -ne 0) {
-            Get-Content inno-install.log -Tail 40
+            if (Test-Path inno-install.log) { Get-Content inno-install.log -Tail 40 }
             throw "Installer exited $($p.ExitCode)"
           }
 
@@ -195,8 +209,12 @@ jobs:
           $unins = Join-Path $app 'unins000.exe'
           Assert (Test-Path $unins) 'uninstaller present'
           if (Test-Path $unins) {
-            Start-Process -FilePath $unins -Wait `
-              -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+            $u = Start-Process -FilePath $unins -PassThru `
+                   -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+            if (-not $u.WaitForExit(300000)) {
+              $u | Stop-Process -Force -ErrorAction SilentlyContinue
+              throw "Uninstaller hung"
+            }
             # Inno respawns itself out of %TEMP% to delete its own exe, so the
             # -Wait above returns while the real work is still running.
             $deadline = (Get-Date).AddMinutes(3)
