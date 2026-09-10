@@ -1092,11 +1092,30 @@ function Restart-WindowsExplorer {
 
 #region Validation & detection ------------------------------------------------
 
+function Get-ComparablePath {
+    # Both sides of a path comparison have to be spelled the same way, and the
+    # two sources here disagree: an environment variable can hand back an 8.3
+    # name - a GitHub runner sets TEMP to C:\Users\RUNNER~1\... - while a path
+    # that came from enumerating the filesystem is always expanded.
+    #
+    # A raw -ieq or StartsWith between those two silently fails open, and both
+    # callers fail open in the dangerous direction: Test-IsSearchableRoot stops
+    # recognising %TEMP% as too broad and enumerates the whole of it, and
+    # Test-ProtectedPath stops recognising a system folder as protected.
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    $p = $Path.Trim()
+    try { $p = [System.IO.Path]::GetFullPath($p) } catch { }
+    try { Initialize-Native; $p = [WinRegister.Native]::ExpandShortPath($p) } catch { }
+    if ($p -notmatch '^[A-Za-z]:\\$') { $p = $p.TrimEnd('\') }
+    return $p
+}
+
 function Test-ProtectedPath {
     param([string]$Path)
-    $full = [System.IO.Path]::GetFullPath($Path)
+    $full = Get-ComparablePath -Path $Path
     foreach ($protected in $script:Cfg.ProtectedPaths) {
-        if ($full.StartsWith($protected, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if ($full.StartsWith((Get-ComparablePath -Path $protected), [System.StringComparison]::OrdinalIgnoreCase)) {
             return $true
         }
     }
@@ -1910,8 +1929,8 @@ function Test-IsSearchableRoot {
     # registration is not worth that, so the walk stops and the entry is pruned.
     param([string]$Path)
     if (-not $Path) { return $false }
-    $p = $Path.TrimEnd('\')
-    if ($p -match '^[A-Za-z]:$') { return $false }
+    $p = Get-ComparablePath -Path $Path
+    if ($p -match '^[A-Za-z]:\\?$') { return $false }
     $forbidden = @(
         $env:USERPROFILE, $env:APPDATA, $env:LOCALAPPDATA, $env:ProgramData,
         $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:WINDIR,
@@ -1924,7 +1943,7 @@ function Test-IsSearchableRoot {
         (Join-Path $env:USERPROFILE 'Downloads')
     ) | Where-Object { $_ }
     foreach ($f in $forbidden) {
-        if ($p -ieq $f.TrimEnd('\')) { return $false }
+        if ($p -ieq (Get-ComparablePath -Path $f)) { return $false }
     }
     return $true
 }
@@ -4841,6 +4860,22 @@ function Invoke-SelfTest {
         (-not (Test-IsSearchableRoot -Path $env:USERPROFILE)) -and
         (-not (Test-IsSearchableRoot -Path $env:ProgramFiles)) -and
         (Test-IsSearchableRoot -Path 'D:\Tools\PortableApps')
+    }
+    # A short-path spelling reaches these guards whenever an environment
+    # variable is set to one, and an unnormalised compare fails open - the walk
+    # stops recognising %TEMP% as too broad and enumerates all of it.
+    $shortPF = $null
+    try {
+        $sp = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($env:ProgramFiles).ShortPath
+        if ($sp -and $sp -ine $env:ProgramFiles) { $shortPF = $sp }
+    } catch { }
+    Test-Step 'Path compare: short and long spellings normalise together' {
+        if (-not $shortPF) { return $true }   # 8.3 generation is off on this volume
+        (Get-ComparablePath -Path $shortPF) -ieq (Get-ComparablePath -Path $env:ProgramFiles)
+    }
+    Test-Step 'Search roots: a short-path spelling of a forbidden root is still forbidden' {
+        if (-not $shortPF) { return $true }
+        -not (Test-IsSearchableRoot -Path $shortPF)
     }
     Test-Step 'Search roots: the ancestor walk is bounded' {
         $e = [pscustomobject]@{ ExePath = "$tempDir\a\b\c\d\e\f\app.exe" }
