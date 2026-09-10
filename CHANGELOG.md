@@ -22,6 +22,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
   the failure above surfaced as setup hanging indefinitely rather than as an
   error. `Environment.UserInteractive` does not cover this: a CI runner and
   Inno's `[Run]` step both report interactive while having nobody to click.
+- **Two path guards failed open when an environment variable held an 8.3 short
+  name.** `Test-IsSearchableRoot` and `Test-ProtectedPath` compared a path
+  derived from the filesystem — always expanded — against raw environment
+  variables, which may not be. When they disagree the comparison silently
+  misses: the relocation walk stops recognising `%TEMP%` as too broad and
+  climbs straight past it to enumerate the whole tree, which is the runaway the
+  stop-at-the-first-rejected-ancestor rule exists to prevent, and a system
+  folder stops counting as protected. Both spellings now normalise first.
 - **A failure in an unattended run would hang forever instead of failing.** The
   top-level error handler raises a modal message box, and a modal blocks its
   caller until someone clicks it. Two callers have nobody to: the self-heal
@@ -39,7 +47,9 @@ versioning follows [Semantic Versioning](https://semver.org/).
   is published. The installer restarts Explorer and rewrites the shell, so it
   could never be exercised on a development machine; until now the only evidence
   any release worked was that it compiled.
-- Self-test cases for the dialog guards and the update checker. 66 → 71.
+- Self-test cases for the dialog guards, the update checker and short-path
+  normalisation, and failure messages that say what was actually found instead
+  of "returned false". 66 → 74.
 
 ## [1.6.1] - 2026-09-10
 
