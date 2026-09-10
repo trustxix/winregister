@@ -205,6 +205,42 @@ jobs:
           $log = Join-Path $app 'winregister.log'
           if (Test-Path $log) { Write-Host "== install log =="; Get-Content $log -Tail 30 }
 
+          # The path every existing user takes. Their install is a pre-1.6.2 one
+          # that never wired anything up, or a manual install from the .vbs era,
+          # so the upgrade has to correct state rather than just land on empty.
+          Write-Host "== Re-installing over the existing install =="
+          $legacyVbs  = Join-Path $app 'winregister-launcher.vbs'
+          $verbCmdKey = "HKCU:\Software\Classes\exefile\shell\$($verbs[0])\command"
+          Set-Content -LiteralPath $legacyVbs -Value 'WScript.Quit 0' -Encoding ASCII
+          Set-ItemProperty -LiteralPath $verbCmdKey -Name '(default)' `
+            -Value ('wscript.exe //nologo "{0}" -Register "%1"' -f $legacyVbs)
+          Assert ((Get-ItemProperty $verbCmdKey).'(default)' -like '*wscript.exe*') 'legacy .vbs state staged'
+
+          $p2 = Start-Process -FilePath $setup -PassThru `
+                  -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/LOG=inno-upgrade.log'
+          if (-not $p2.WaitForExit(300000)) {
+            if (Test-Path inno-upgrade.log) { Get-Content inno-upgrade.log -Tail 60 }
+            $p2 | Stop-Process -Force -ErrorAction SilentlyContinue
+            throw "Upgrade install hung"
+          }
+          Assert ($p2.ExitCode -eq 0) "upgrade install exited 0 (got $($p2.ExitCode))"
+
+          $cmd2 = (Get-ItemProperty $verbCmdKey).'(default)'
+          Assert ($cmd2 -like '*winregister-launcher.exe*') "upgrade rewrites the stale verb command: $cmd2"
+          Assert ($cmd2 -notlike '*wscript*') 'no wscript left in the verb command'
+          Assert (-not (Test-Path $legacyVbs)) 'legacy .vbs launcher removed'
+          Assert (Test-Path (Join-Path $app '.installed')) 'install marker survives the upgrade'
+          Assert (Test-Path (Join-Path $app 'winregister-launcher.exe')) 'compiled launcher still present'
+          if (Test-Path $owner) {
+            Assert ((Get-Content $owner -Raw).Trim() -eq 'external') 'ARP ownership still external after upgrade'
+          }
+          Assert (-not (Test-Path "$arpRoot\WinRegister.Self")) 'upgrade adds no second ARP row'
+
+          # An upgrade that appends rather than replaces shows up here first.
+          $sm = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\WinRegister'
+          $lnks = @(Get-ChildItem -LiteralPath $sm -Filter *.lnk -ErrorAction SilentlyContinue)
+          Assert ($lnks.Count -eq 2) "Start Menu holds exactly 2 shortcuts, not duplicates (found $($lnks.Count))"
+
           Write-Host "== Uninstalling =="
           $unins = Join-Path $app 'unins000.exe'
           Assert (Test-Path $unins) 'uninstaller present'
