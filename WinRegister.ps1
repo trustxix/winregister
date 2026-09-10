@@ -4893,8 +4893,11 @@ function Invoke-SelfTest {
                 ExePath     = (Join-Path $movedRoot 'Gone\SelfTestApp.exe')
                 DisplayName = 'SelfTest App'; Vendor = '' }
             # Unclaimed it is found; claimed by someone else it must be refused.
-            ((Find-RelocatedExecutable -Entry $e) -ieq $only) -and
-            ($null -eq (Find-RelocatedExecutable -Entry $e -ClaimedPaths @($only)))
+            $found = Find-RelocatedExecutable -Entry $e
+            if ($found -ine $only) { throw "unclaimed: found '$found', expected '$only'" }
+            $claimed = Find-RelocatedExecutable -Entry $e -ClaimedPaths @($only)
+            if ($null -ne $claimed) { throw "claimed by another entry: expected refusal, got '$claimed'" }
+            $true
         } finally {
             Remove-Item -LiteralPath $movedRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
