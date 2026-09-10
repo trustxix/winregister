@@ -102,6 +102,48 @@ correct than re-deriving it — and it must be written down *before* the write i
 attempted, or a failing write turns a one-off three-hive registry scan into a
 scan on every single right-click.
 
+## An artefact nobody can run is an artefact nobody has run
+
+The installer restarts Explorer and rewrites the shell, so it was never
+executed on a development machine — and its only evidence of working was that
+it compiled. It did not work. Inno lays the script down in `{app}`, which *is*
+the install location, then runs that copy with `-Install`, whose first act is to
+copy the script to the install location: source and destination were the same
+file and `Copy-Item -Force` threw on step one. No verb key, launcher, `PATH`
+entry or shortcut was ever created by an installer-driven install, on any
+released version, for four months.
+
+The same constraint that made it unrunnable made it unverifiable, which is why
+it survived. A throwaway runner is where that constraint does not apply:
+restarting Explorer costs nothing there. Since 1.6.2 the build installs,
+asserts the footprint, runs the suite against the installed copy, uninstalls,
+and asserts the teardown — and a failure blocks the release.
+
+## A CI runner is a differently-configured machine, and that is the point
+
+The first green run took five attempts, and the four failures along the way
+were all real: two test-fixture bugs, and one product bug that could not have
+been found here. A GitHub runner sets `TEMP` to an 8.3 short path
+(`C:\Users\RUNNER~1\...`). `Test-IsSearchableRoot` compared a filesystem-derived
+path — always expanded — against that raw variable, so the two spellings never
+matched, `%TEMP%` stopped counting as too broad to search, and the relocation
+walk climbed straight past it into the whole tree.
+
+Both guards that compare against environment variables failed **open**, in the
+direction that does damage. The lesson generalises past 8.3: if a comparison
+draws its two sides from different sources, normalise both, and prefer a guard
+that fails closed when it cannot.
+
+Nothing about that is exotic — it is simply a machine configured unlike the
+author's, which is the only kind of machine the software will actually run on.
+
+## "Returned false" is not a test result
+
+Four cases failed on the runner reporting nothing but `returned false`, and
+diagnosing them cost two CI cycles that a single sentence of context would have
+saved. A test that runs somewhere you cannot attach a debugger has to carry its
+own evidence: what it found, what it expected, what the store actually held.
+
 ## Verification tooling can be more dangerous than the change
 
 The natural way to test "is this verb visible?" is to enumerate the context menu

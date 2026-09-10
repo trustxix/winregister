@@ -133,6 +133,24 @@ filename is resolved against *that* process's DLL search path.
 documents `lpszFile` as the name of a file to extract from — it needs a real
 path. The negative index is correct: it is a resource identifier, not an offset.
 
+### ✗ Comparing a path against a raw environment variable
+
+`Test-IsSearchableRoot` and `Test-ProtectedPath` both did, and both failed
+**open**. A path that came from enumerating the filesystem is always expanded;
+an environment variable need not be — a GitHub runner sets `TEMP` to
+`C:\Users\RUNNER~1\AppData\Local\Temp`. The two spellings never compare equal,
+so `%TEMP%` stopped counting as too broad to search and the relocation walk
+enumerated all of it.
+
+Normalise both sides (`Get-ComparablePath`). Note the expansion only works on a
+path that **exists** — `GetLongPathNameW` returns 0 otherwise — which is fine
+for these two callers and would not be for a validator run before creation.
+
+### ✗ `Scripting.FileSystemObject` (or `GetFullPath`, or `Resolve-Path`) to expand an 8.3 path
+
+None of them do it; they all hand the short path straight back. Measured.
+`GetLongPathNameW` is the only thing that resolves it.
+
 ### ✗ `[Math]::Max(0, $someInt64)`
 
 Binds the `Max(int, int)` overload because the literal is an `Int32`, and throws
