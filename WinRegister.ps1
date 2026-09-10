@@ -4493,8 +4493,16 @@ function Invoke-SelfTest {
         Invoke-Register -InputPath $tempExe -OverrideName 'SelfTest App' -SkipConfirm
         $store = Get-RegistrationStore
         $hit = $store.Keys | Where-Object { (Get-SafeProperty $store[$_] 'ExePath') -ieq $tempExe }
-        if (-not $hit) { return $false }
-        Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$aumid"
+        if (-not $hit) {
+            # "returned false" says nothing on a machine you cannot attach to.
+            $paths = @($store.Keys | ForEach-Object { Get-SafeProperty $store[$_] 'ExePath' })
+            throw ("no store entry for '$tempExe'; store holds {0}: {1}" -f `
+                   $store.Count, (($paths | Select-Object -First 3) -join ' | '))
+        }
+        if (-not (Test-Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$aumid")) {
+            throw "store entry exists but ARP key '$aumid' does not"
+        }
+        $true
     }
     Test-Step 'Unregister: removes shortcut + ARP entry' {
         Invoke-Unregister -InputPath $tempExe -SkipConfirm
@@ -4818,7 +4826,10 @@ function Invoke-SelfTest {
                 DisplayName = 'SelfTest App'
                 Vendor      = (Get-ExeIdentity -Path $tempExe).Company
             }
-            (Find-RelocatedExecutable -Entry $e) -ieq (Join-Path $v2 'SelfTestApp.exe')
+            $found  = Find-RelocatedExecutable -Entry $e
+            $expect = Join-Path $v2 'SelfTestApp.exe'
+            if ($found -ine $expect) { throw "found '$found', expected '$expect'" }
+            $true
         } finally {
             Remove-Item -LiteralPath $movedRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
