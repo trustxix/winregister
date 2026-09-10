@@ -22,6 +22,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history and tags: the release-notes step needs to know which
+          # version users could last install, and the default depth fetches
+          # neither. https://github.com/actions/checkout#fetch-all-history
+          fetch-depth: 0
 
       - name: Resolve version
         id: ver
@@ -64,6 +69,45 @@ jobs:
           }
           Write-Host "OK: parses cleanly"
 
+      - name: Build release notes from CHANGELOG
+        shell: pwsh
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($v))\]" |
+                    Select-Object -First 1).LineNumber
+          if (-not $start) {
+            Write-Warning "No '## [$v]' section in CHANGELOG.md; publishing a pointer instead."
+            Set-Content RELEASE_BODY.md -Value "See [CHANGELOG.md](CHANGELOG.md) for the full history." -Encoding UTF8
+            exit 0
+          }
+
+          # Stop at the last version users could actually install, not at the
+          # previous CHANGELOG heading: a release that spans several versions
+          # must carry every section since that tag, or the intervening notes
+          # are never published anywhere.
+          $prev = git tag --sort=-v:refname |
+                  Where-Object { $_ -match '^v\d' -and $_ -ne "v$v" } |
+                  Select-Object -First 1
+          $end = $null
+          if ($prev) {
+            $pv = $prev -replace '^v', ''
+            $end = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($pv))\]" |
+                    Select-Object -First 1).LineNumber
+          }
+          if (-not $end) {
+            $end = ($lines | Select-String -Pattern '^## \[' |
+                    Where-Object { $_.LineNumber -gt $start } |
+                    Select-Object -First 1).LineNumber
+          }
+          $last = if ($end) { $end - 2 } else { $lines.Count - 1 }
+
+          ($lines[($start - 1)..$last] -join "`n").TrimEnd() |
+            Set-Content RELEASE_BODY.md -Encoding UTF8
+          if ($prev) { Write-Host "Notes cover $v back to $prev" }
+          Write-Host "--------"
+          Get-Content RELEASE_BODY.md | Select-Object -First 20
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y
@@ -104,6 +148,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          # Without one of these the body is published empty - the action does
+          # not fall back to the tag annotation.
+          body_path: RELEASE_BODY.md
+          generate_release_notes: true
           files: |
             installer/output/WinRegister-Setup-${{ steps.ver.outputs.version }}.exe
             WinRegister-${{ steps.ver.outputs.version }}-source.zip
