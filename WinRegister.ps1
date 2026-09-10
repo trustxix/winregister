@@ -166,7 +166,7 @@ $ErrorActionPreference = 'Stop'
 #region Configuration ----------------------------------------------------------
 
 $script:Cfg = [pscustomobject]@{
-    Version              = '1.6.0'
+    Version              = '1.6.1'
     SchemaVersion        = 2
     SettingsSchemaVersion= 2
     AppName              = 'WinRegister'
@@ -558,6 +558,22 @@ function Compare-SemVer {
     }
 }
 
+function ConvertTo-CrLfText {
+    # A multiline WinForms TextBox breaks lines on CRLF only: a bare LF is drawn
+    # as a control glyph and the whole string collapses onto one unwrapped line.
+    # GitHub returns release bodies with LF endings - measured on the live v1.6.0
+    # response: 171 bare LF against 1 CRLF - so anything from the API headed for
+    # a TextBox has to be normalised on the way in.
+    # https://learn.microsoft.com/en-us/dotnet/api/system.windows.forms.textboxbase.lines
+    #
+    # It is a function rather than an inline replace so the self-test can lock the
+    # behaviour without opening the dialog that would otherwise be the only way
+    # to observe it.
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    return ((($Text -replace "`r`n", "`n") -replace "`r", "`n") -replace "`n", "`r`n")
+}
+
 function Test-UpdateAvailable {
     param(
         [pscustomobject]$Settings,
@@ -665,7 +681,7 @@ function Show-UpdateNotification {
     $notes.Multiline = $true
     $notes.ScrollBars = 'Vertical'
     $notes.ReadOnly = $true
-    $notes.Text = if ($Update.Notes) { $Update.Notes } else { '(no release notes)' }
+    $notes.Text = if ($Update.Notes) { ConvertTo-CrLfText $Update.Notes } else { '(no release notes)' }
     $notes.Location = New-Object System.Drawing.Point(20, 75)
     $notes.Size = New-Object System.Drawing.Size(440, 90)
     $notes.BackColor = [System.Drawing.Color]::White
@@ -4844,6 +4860,32 @@ function Invoke-SelfTest {
     Test-Step 'Settings: maintenance knobs default to on' {
         $m = (Get-DefaultSettings).Maintenance
         $m.AutoHeal -and $m.AutoRelocate -and $m.AutoPrune -and $m.ScheduledTask
+    }
+
+    # 9. Update checker. Decides whether a notification interrupts the user, so
+    # the comparison and the text it would render are both worth pinning. Nothing
+    # here touches the network or opens the dialog.
+    Test-Step 'Update notes: bare LF becomes CRLF for the TextBox' {
+        (ConvertTo-CrLfText "a`nb`nc") -eq "a`r`nb`r`nc"
+    }
+    Test-Step 'Update notes: existing CRLF is not doubled' {
+        (ConvertTo-CrLfText "a`r`nb") -eq "a`r`nb"
+    }
+    Test-Step 'Update notes: mixed endings normalise (the real API shape)' {
+        (ConvertTo-CrLfText "a`r`nb`nc`rd") -eq "a`r`nb`r`nc`r`nd"
+    }
+    Test-Step 'Update notes: empty stays empty, never $null' {
+        (ConvertTo-CrLfText $null) -eq '' -and (ConvertTo-CrLfText '') -eq ''
+    }
+    Test-Step 'SemVer: a newer release is newer' { (Compare-SemVer -A '1.7.0' -B '1.6.0') -gt 0 }
+    Test-Step 'SemVer: the running version is not an update' {
+        (Compare-SemVer -A $script:Cfg.Version -B $script:Cfg.Version) -eq 0
+    }
+    Test-Step 'SemVer: a leading v on the tag is ignored' {
+        (Compare-SemVer -A 'v1.6.0' -B '1.6.0') -eq 0
+    }
+    Test-Step 'SemVer: 1.10.0 outranks 1.9.0 (not a string compare)' {
+        (Compare-SemVer -A '1.10.0' -B '1.9.0') -gt 0
     }
 
     # Cleanup

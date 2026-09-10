@@ -4,6 +4,31 @@ All notable changes to WinRegister are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.6.1] - 2026-09-10
+
+### Fixed
+- **The "update available" window rendered release notes as one unreadable
+  line.** A multiline WinForms text box breaks lines on CRLF only, and the
+  GitHub API returns release bodies with bare LF endings — measured on the live
+  v1.6.0 response: 171 bare LF against a single CRLF. Every newline was drawn as
+  a control glyph and the notes collapsed onto one unwrapped line inside a box
+  that only scrolls vertically. Latent until now, because every release
+  published before v1.6.0 had an **empty** body, so the dialog always fell
+  through to "(no release notes)".
+
+### Changed
+- Releases now carry real notes. The build slices them out of this changelog,
+  from the tagged version back to the previous tag, so a release spanning
+  several versions publishes all of their sections instead of only the newest.
+  `softprops/action-gh-release` does not fall back to the tag annotation; with
+  no body input it publishes nothing at all, which is what every release up to
+  v1.3.0 did.
+
+### Added
+- Self-test coverage for the update checker — line-ending normalisation and the
+  version comparison that decides whether a notification interrupts the user.
+  Neither had a single case before. 58 → 66.
+
 ## [1.6.0] - 2026-09-08
 
 ### Fixed
