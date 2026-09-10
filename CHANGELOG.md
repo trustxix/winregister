@@ -7,6 +7,21 @@ versioning follows [Semantic Versioning](https://semver.org/).
 ## [1.6.2] - 2026-09-10
 
 ### Fixed
+- **The installer has never wired anything up.** Inno Setup lays `WinRegister.ps1`
+  down in `{app}` — which *is* the install location — and then runs that copy
+  with `-Install`. The first thing `-Install` does is copy the script to the
+  install location, so source and destination were the same file and
+  `Copy-Item -Force` threw "Cannot overwrite the item with itself". It threw on
+  the very first step, so no context-menu verb, launcher, `PATH` entry, Start
+  Menu shortcut or scheduled task was ever created by an installer-driven
+  install, on any released version. Only the manual `-Install` path worked,
+  because there the script is somewhere else at the time. Found on the first run
+  of the new install smoke test.
+- **`-Silent` now means no dialogs, not just no informational toasts.** A silent
+  install that pops a modal is not silent, and Inno waits on that process — so
+  the failure above surfaced as setup hanging indefinitely rather than as an
+  error. `Environment.UserInteractive` does not cover this: a CI runner and
+  Inno's `[Run]` step both report interactive while having nobody to click.
 - **A failure in an unattended run would hang forever instead of failing.** The
   top-level error handler raises a modal message box, and a modal blocks its
   caller until someone clicks it. Two callers have nobody to: the self-heal

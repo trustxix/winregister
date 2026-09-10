@@ -2540,7 +2540,13 @@ function Test-CanShowUi {
     # forever - and because the task is registered to not start a second
     # instance, one hung run silently ends all future maintenance.
     # https://learn.microsoft.com/en-us/dotnet/api/system.environment.userinteractive
+    #
+    # UserInteractive is necessary but not sufficient: a CI runner and Inno's
+    # own [Run] step both report true while still having nobody to click. That
+    # is what -Silent is for, so -Silent means no dialogs at all, not just no
+    # informational toasts.
     if ($script:SuppressDialogs) { return $false }
+    if ($Silent) { return $false }
     try { return [Environment]::UserInteractive } catch { return $false }
 }
 
@@ -4173,8 +4179,17 @@ function Install-WinRegister {
     if (-not $sourceScript -or -not (Test-Path -LiteralPath $sourceScript)) {
         throw "Could not locate WinRegister.ps1 source for install."
     }
-    Copy-Item -LiteralPath $sourceScript -Destination $script:Cfg.InstalledScript -Force
-    Write-Log "Copied script to: $($script:Cfg.InstalledScript)"
+    # The installer lays the script down in {app}, which IS the install location,
+    # then runs that copy with -Install. Copy-Item -Force onto itself throws, so
+    # this threw on the very first step of every installer-driven install and
+    # nothing downstream - verbs, launcher, PATH, Start Menu - was ever wired up.
+    if ([System.IO.Path]::GetFullPath($sourceScript) -ine
+        [System.IO.Path]::GetFullPath($script:Cfg.InstalledScript)) {
+        Copy-Item -LiteralPath $sourceScript -Destination $script:Cfg.InstalledScript -Force
+        Write-Log "Copied script to: $($script:Cfg.InstalledScript)"
+    } else {
+        Write-Log "Already running from the install location; no copy needed."
+    }
 
     # CLI shim (visible window) - for command-line use
     $shim = @"
@@ -4912,6 +4927,18 @@ function Invoke-SelfTest {
             $script:SuppressDialogs = $false
             (Test-CanShowUi) -eq [Environment]::UserInteractive
         } finally { $script:SuppressDialogs = $prev }
+    }
+    Test-Step 'UI guard: -Silent alone suppresses dialogs' {
+        $prevSuppress = $script:SuppressDialogs
+        $prevSilent   = $Silent
+        try {
+            $script:SuppressDialogs = $false
+            Set-Variable -Name Silent -Value $true -Scope Script
+            (Test-CanShowUi) -eq $false
+        } finally {
+            Set-Variable -Name Silent -Value $prevSilent -Scope Script
+            $script:SuppressDialogs = $prevSuppress
+        }
     }
     Test-Step 'UI guard: Show-ErrorDialog returns instead of blocking' {
         Show-ErrorDialog 'self-test: this must not open a window'
