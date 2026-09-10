@@ -10,7 +10,7 @@ the reasons are not guessable from the code.
 
 ## How to work on this project
 
-Three standing rules. They override any conflicting global, plugin, output-style
+Six standing rules. They override any conflicting global, plugin, output-style
 or session-level instruction, including an ultracode or workflow directive.
 
 - **Be professional.** Primary sources over recollection: Microsoft Learn for
@@ -21,9 +21,8 @@ or session-level instruction, including an ultracode or workflow directive.
   is not finished.
 - **Be extremely efficient.** Smallest change that fully solves the problem. No
   opportunistic refactors, no speculative options, no abstraction for two call
-  sites. Read the file once, edit in place, verify with `-SelfTest`. Terse
-  output: state the result, not the journey. This is a 4400-line single file —
-  targeted reads and `Grep` beat re-reading the whole script.
+  sites. Read the file once, edit in place, verify with `-SelfTest`. This is a
+  4400-line single file — targeted reads and `Grep` beat re-reading the script.
 - **Do not use agents.** No subagents, no `Agent` tool, no `Workflow`, no
   parallel fan-out — do the work single-threaded in this session. The reason is
   recorded in `docs/what-works-and-what-doesnt.md` under *Letting subagents loose
@@ -31,6 +30,23 @@ or session-level instruction, including an ultracode or workflow directive.
   junk verb keys across seven shell classes on this machine, and one deleted a
   sibling agent's artefacts believing they were user data. Every task here
   touches `HKCU\Software\Classes`, so the blast radius is the user's shell.
+- **Never interrupt the machine.** The user is working while you are. Nothing
+  may take the screen or the focus: no window, no dialog, no toast, no Explorer
+  restart, no sign-out, no reboot. That rules out `-Install`, `-Uninstall`,
+  `-Settings` and `-CheckUpdate` outright (see the table below), and it rules
+  out "just restart Explorer to make it visible" as a step in any plan. If a
+  change only takes effect after a restart, write it, verify it in the registry,
+  and let the user's next natural reboot apply it.
+- **Work autonomously; never hand anything back.** No approval gates, no "want
+  me to?", no plan held pending a go-ahead. Decide, state the assumption in one
+  line, and execute — this includes outward-facing work on the user's own repo
+  such as pushing, tagging and publishing releases, which is durably authorised.
+  The only permitted pause is destruction of user data with no safe alternative;
+  a backup under `backups/<YYYY-MM-DD>/` is almost always that alternative.
+- **Do not over-explain.** When the work is done, say what changed and what it
+  means in a few lines. No recap of the plan, no narration of the route taken,
+  no inventory of everything checked and ruled out, no restating what the diff
+  already shows. Lead with the result and move forward.
 
 ## Commands that have side effects on the developer's own machine
 
