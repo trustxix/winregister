@@ -4,6 +4,25 @@ All notable changes to WinRegister are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.6.3] - 2026-11-08
+
+### Fixed
+- **Registering a new build beside an old one left two identically named
+  entries.** Registering `Narrative Engine\Narrative Engine.exe` (a launcher
+  shim) beside an existing registration of
+  `NarrativeEngine_0.42.2\StartNarrativeEngine.exe` kept both, and the new
+  Start Menu shortcut became "Narrative Engine (Narrative Engine)". The old
+  build still existed on disk, so the healer restored it daily instead of ever
+  pruning it. A registration now supersedes any other with the same display
+  name whose exe sits in the same or a sibling folder: its shortcut, App Paths
+  key and Apps & Features row are removed. Siblings only count under a folder
+  the relocation walk would accept (never Desktop, Documents, Program Files or a
+  drive root), and a disagreeing publisher means a different program.
+- **The name-collision suffix repeated the name** when the exe is named after
+  the program. It now falls back to the exe's folder.
+
+Self-test: 74 → 76 cases.
+
 ## [1.6.2] - 2026-09-10
 
 ### Fixed

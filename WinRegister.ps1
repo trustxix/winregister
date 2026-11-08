@@ -166,7 +166,7 @@ $ErrorActionPreference = 'Stop'
 #region Configuration ----------------------------------------------------------
 
 $script:Cfg = [pscustomobject]@{
-    Version              = '1.6.2'
+    Version              = '1.6.3'
     SchemaVersion        = 2
     SettingsSchemaVersion= 2
     AppName              = 'WinRegister'
@@ -1544,6 +1544,39 @@ function Find-RegistrationByExe {
         }
     }
     return $null
+}
+
+function Find-SupersededRegistration {
+    # Registrations a new one replaces: same display name, exe in the same folder
+    # or a sibling folder - a newer build (App_1.2\ beside App_1.1\) or a launcher
+    # shim that took over from a versioned exe. Two Start Menu entries with one
+    # name cannot be told apart in Search, and the stale one still exists on disk,
+    # so the healer would restore it daily rather than ever pruning it. Siblings
+    # only count under a folder Test-IsSearchableRoot accepts, so unrelated
+    # programs side by side in Program Files or Desktop are never matched, and a
+    # publisher that positively disagrees means a different program.
+    param([string]$DisplayName, [string]$ExePath, [string]$Vendor, [string]$ExcludeId)
+    $found = @()
+    if (-not $DisplayName -or -not $ExePath) { return $found }
+    $newDir = Split-Path -Path $ExePath -Parent
+    $newParent = Split-Path -Path $newDir -Parent
+    $siblingsCount = Test-IsSearchableRoot -Path $newParent
+    $store = Get-RegistrationStore
+    foreach ($key in @($store.Keys)) {
+        if ($ExcludeId -and $key -eq $ExcludeId) { continue }
+        $entry = $store[$key]
+        if ((Get-SafeProperty $entry 'DisplayName' -Default '') -ine $DisplayName) { continue }
+        $oldExe = Get-SafeProperty $entry 'ExePath' -Default ''
+        if (-not $oldExe -or $oldExe -ieq $ExePath) { continue }
+        $oldDir = Split-Path -Path $oldExe -Parent
+        $near = ($oldDir -ieq $newDir) -or
+                ($siblingsCount -and ((Split-Path -Path $oldDir -Parent) -ieq $newParent))
+        if (-not $near) { continue }
+        $oldVendor = Get-SafeProperty $entry 'Vendor' -Default ''
+        if ($Vendor -and $oldVendor -and ($Vendor -ine $oldVendor)) { continue }
+        $found += [pscustomobject]@{ Id = $key; Entry = $entry }
+    }
+    return $found
 }
 
 #endregion
@@ -3200,6 +3233,23 @@ function Invoke-Register {
             }
         }
 
+        # Retire a same-named older build beside this one, so the user ends up
+        # with one entry instead of "Name" plus a stale "Name (Name)".
+        $excludeId = if ($existing) { $existing.Id } else { '' }
+        $superseded = @(Find-SupersededRegistration -DisplayName $meta.DisplayName `
+            -ExePath $meta.ExePath -Vendor $meta.Vendor -ExcludeId $excludeId)
+        foreach ($old in $superseded) {
+            Write-Log "Superseding $($old.Id): $(Get-SafeProperty $old.Entry 'ExePath')"
+            try {
+                Remove-ShortcutFile -Path (Get-SafeProperty $old.Entry 'ShortcutPath')
+                Remove-AppPathsEntry -KeyName (Get-SafeProperty $old.Entry 'AppPathsKey')
+                Remove-UninstallEntry -AppId   (Get-SafeProperty $old.Entry 'AppId')
+            } catch {
+                Write-Log "Cleanup of superseded registration $($old.Id) warning: $_" -Level Warn
+            }
+        }
+        $supersededIds = @($superseded | ForEach-Object { $_.Id })
+
         $appId = New-AppId -DisplayName $meta.DisplayName -ExePath $meta.ExePath
         $shortcutFileName = Get-SafeFilename -Text $meta.DisplayName -Fallback $meta.BaseName
 
@@ -3218,7 +3268,11 @@ function Invoke-Register {
         $shortcutPath = Join-Path $startMenuDir "$shortcutFileName.lnk"
 
         if ((Test-Path -LiteralPath $shortcutPath) -and -not $existing) {
-            $shortcutPath = Join-Path $startMenuDir "$shortcutFileName ($($meta.BaseName)).lnk"
+            # The suffix has to tell the two apart; an exe named after the
+            # program would only repeat it, so fall back to its folder.
+            $suffix = $meta.BaseName
+            if ($suffix -ieq $shortcutFileName) { $suffix = Split-Path -Path $meta.WorkingDir -Leaf }
+            $shortcutPath = Join-Path $startMenuDir "$shortcutFileName ($suffix).lnk"
         }
 
         # Critical step: shortcut. Fail hard if this fails.
@@ -3276,6 +3330,7 @@ function Invoke-Register {
         }
         Edit-RegistrationStore {
             param($store)
+            foreach ($id in $supersededIds) { $store.Remove($id) }
             $store[$appId] = $newEntry
         }.GetNewClosure()
         Update-ContextMenuConditions
@@ -4604,6 +4659,36 @@ function Invoke-SelfTest {
         (@($b.exefile.Values) -contains 'C:\Apps\Tool\tool.exe') -and
         (@($b.Directory.Values) -contains 'C:\Apps\Tool') -and
         (@($b.lnkfile.Values) -contains 'C:\SM\Tool.lnk')
+    }
+    Test-Step 'Supersede: same-named build in a sibling folder is replaced, nothing else is' {
+        # The 2026-11-08 case: a launcher shim registered beside the versioned
+        # build it replaced, which used to leave "Name" and "Name (Name)".
+        $probe = [ordered]@{
+            'Old'     = [pscustomobject]@{ DisplayName = 'Narrative Engine'; ExePath = 'C:\Work\out\NarrativeEngine_0.42.2\StartNarrativeEngine.exe' }
+            'Self'    = [pscustomobject]@{ DisplayName = 'Narrative Engine'; ExePath = 'C:\Work\out\Narrative Engine\Old.exe' }
+            'Far'     = [pscustomobject]@{ DisplayName = 'Narrative Engine'; ExePath = 'C:\Elsewhere\Narrative Engine\ne.exe' }
+            'Other'   = [pscustomobject]@{ DisplayName = 'Story Tool';       ExePath = 'C:\Work\out\StoryTool\st.exe' }
+            'Foreign' = [pscustomobject]@{ DisplayName = 'Narrative Engine'; ExePath = 'C:\Work\out\Fork\ne.exe'; Vendor = 'Someone Else' }
+        }
+        $ids = & {
+            function Get-RegistrationStore { $probe }
+            @(Find-SupersededRegistration -DisplayName 'narrative engine' -Vendor 'Trust' -ExcludeId 'Self' `
+                -ExePath 'C:\Work\out\Narrative Engine\Narrative Engine.exe') | ForEach-Object { $_.Id }
+        }
+        if ((@($ids) -join ',') -ne 'Old') { throw "expected 'Old', got '$(@($ids) -join ',')'" }
+        $true
+    }
+    Test-Step 'Supersede: siblings under a broad root such as Desktop never match' {
+        $desk = Join-Path $env:USERPROFILE 'Desktop'
+        $probe = [ordered]@{
+            'A' = [pscustomobject]@{ DisplayName = 'Launcher'; ExePath = (Join-Path $desk 'GameA\Launcher.exe') }
+        }
+        $n = & {
+            function Get-RegistrationStore { $probe }
+            @(Find-SupersededRegistration -DisplayName 'Launcher' -ExePath (Join-Path $desk 'GameB\Launcher.exe')).Count
+        }
+        if ($n -ne 0) { throw "matched $n entries across Desktop siblings" }
+        $true
     }
 
     # The writer itself, exercised against a scratch registry root so the user's
